@@ -17,6 +17,7 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.api.storage.MEStorage;
 import appeng.me.storage.NetworkStorageMountObserver;
+import appeng.rebuild.cell.ExactCellId;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
 import appeng.rebuild.planner.PlannerLimits;
@@ -53,10 +54,18 @@ public final class StorageServiceRebuild implements NetworkStorageMountObserver 
     @Override
     public void mounted(int priority, MEStorage storage) {
         Objects.requireNonNull(storage, "storage");
+        if (storage instanceof ExactMountedStorage exactStorage && !exactStorage.claimExactMount(this)) {
+            markLifecycleInconsistent(new IllegalStateException(
+                    "Exact cell UUID is already mounted by another storage service: " + exactStorage.exactCellId()));
+            return;
+        }
         long followingLocationId;
         try {
             followingLocationId = Math.incrementExact(nextLocationId);
         } catch (ArithmeticException failure) {
+            if (storage instanceof ExactMountedStorage exactStorage) {
+                exactStorage.releaseExactMount(this);
+            }
             markLifecycleInconsistent(failure);
             return;
         }
@@ -74,6 +83,9 @@ public final class StorageServiceRebuild implements NetworkStorageMountObserver 
             MountedLocation location = iterator.next();
             if (location.priority == priority && location.storage == storage) {
                 iterator.remove();
+                if (storage instanceof ExactMountedStorage exactStorage) {
+                    exactStorage.releaseExactMount(this);
+                }
                 markDirty();
                 return;
             }
@@ -188,15 +200,26 @@ public final class StorageServiceRebuild implements NetworkStorageMountObserver 
     private List<CapturedLocation> captureMountedLocations() {
         List<CapturedLocation> capturedLocations = new ArrayList<>(mountedLocations.size());
         for (MountedLocation location : mountedLocations) {
-            KeyCounter counter = new KeyCounter();
-            location.storage.getAvailableStacks(counter);
-
-            List<CapturedAmount> amounts = new ArrayList<>(counter.size());
-            for (Object2LongMap.Entry<AEKey> entry : counter) {
-                AEKey key = Objects.requireNonNull(entry.getKey(), "Legacy storage reported a null key");
-                amounts.add(new CapturedAmount(key, AEAmount.of(entry.getLongValue())));
+            List<CapturedAmount> amounts;
+            ExactCellId exactCellId = null;
+            long exactCellRevision = 0L;
+            if (location.storage instanceof ExactMountedStorage exactStorage) {
+                exactCellId = exactStorage.exactCellId();
+                exactCellRevision = exactStorage.exactCellRevision();
+                amounts = new ArrayList<>();
+                exactStorage.enumerateExact((key, amount) -> amounts.add(new CapturedAmount(
+                        Objects.requireNonNull(key, "Exact storage reported a null key"),
+                        Objects.requireNonNull(amount, "Exact storage reported a null amount"))));
+            } else {
+                KeyCounter counter = new KeyCounter();
+                location.storage.getAvailableStacks(counter);
+                amounts = new ArrayList<>(counter.size());
+                for (Object2LongMap.Entry<AEKey> entry : counter) {
+                    AEKey key = Objects.requireNonNull(entry.getKey(), "Legacy storage reported a null key");
+                    amounts.add(new CapturedAmount(key, AEAmount.of(entry.getLongValue())));
+                }
             }
-            capturedLocations.add(new CapturedLocation(location.id, amounts));
+            capturedLocations.add(new CapturedLocation(location.id, amounts, exactCellId, exactCellRevision));
         }
         return capturedLocations;
     }
@@ -216,7 +239,8 @@ public final class StorageServiceRebuild implements NetworkStorageMountObserver 
                 KeyId key = keyRegistry.intern(amount.key);
                 amounts.add(key.value(), amount.amount);
             }
-            snapshots.put(location.id, new StorageLocationSnapshot(location.id, amounts));
+            snapshots.put(location.id, new StorageLocationSnapshot(location.id, amounts, location.exactCellId,
+                    location.exactCellRevision));
         }
         return snapshots;
     }
@@ -231,7 +255,8 @@ public final class StorageServiceRebuild implements NetworkStorageMountObserver 
     private record MountedLocation(StorageLocationId id, int priority, MEStorage storage) {
     }
 
-    private record CapturedLocation(StorageLocationId id, List<CapturedAmount> amounts) {
+    private record CapturedLocation(StorageLocationId id, List<CapturedAmount> amounts, ExactCellId exactCellId,
+            long exactCellRevision) {
     }
 
     private record CapturedAmount(AEKey key, AEAmount amount) {

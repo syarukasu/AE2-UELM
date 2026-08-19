@@ -23,6 +23,7 @@ import java.util.Locale;
 import appeng.server.services.compass.TestCompassCommand;
 import appeng.server.subcommands.ChannelModeCommand;
 import appeng.server.subcommands.ChunkLogger;
+import appeng.server.subcommands.ExactCellRecoveryCommand;
 import appeng.server.subcommands.ReloadConfigCommand;
 import appeng.server.subcommands.SetupTestWorldCommand;
 import appeng.server.subcommands.SpatialStorageCommand;
@@ -36,6 +37,7 @@ public enum Commands {
     CHUNK_LOGGER(4, "chunklogger", new ChunkLogger()),
     SPATIAL(4, "spatial", new SpatialStorageCommand()),
     CHANNEL_MODE(4, "channelmode", new ChannelModeCommand()),
+    CELL_RECOVERY(4, "cellrecover", new ExactCellRecoveryCommand()),
     TICK_MONITORING(4, "tickmonitor", new TickMonitoring()),
 
     // Testing

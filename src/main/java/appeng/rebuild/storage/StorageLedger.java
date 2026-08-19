@@ -148,6 +148,28 @@ public final class StorageLedger {
             }
         }
 
+        // Preserve physical provenance: changing a UUID-backed cell (or moving the same aggregate between
+        // locations) invalidates plans that read any affected key, even when the network total is unchanged.
+        for (StorageLocationId location : changedLocations) {
+            StorageLocationSnapshot previous = snapshots.get(location);
+            StorageLocationSnapshot replacement = stagedSnapshots.get(location);
+            boolean exactProvenanceChanged = previous == null
+                    ? replacement != null && replacement.exactCellId().isPresent()
+                    : replacement == null
+                            ? previous.exactCellId().isPresent()
+                            : !previous.exactCellId().equals(replacement.exactCellId())
+                                    || previous.exactCellRevision() != replacement.exactCellRevision();
+            if (!exactProvenanceChanged) {
+                continue;
+            }
+            if (previous != null) {
+                previous.enumerate((key, amount) -> changedTotals[key.value()] = true);
+            }
+            if (replacement != null) {
+                replacement.enumerate((key, amount) -> changedTotals[key.value()] = true);
+            }
+        }
+
         StorageRevision stagedRevision = revision.next();
         long[] stagedKeyRevisions = Arrays.copyOf(keyRevisions, registry.size());
         for (int index = 0; index < changedTotals.length; index++) {

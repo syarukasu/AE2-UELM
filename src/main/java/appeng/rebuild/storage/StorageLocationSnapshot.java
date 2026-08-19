@@ -1,7 +1,9 @@
 package appeng.rebuild.storage;
 
 import java.util.Objects;
+import java.util.Optional;
 
+import appeng.rebuild.cell.ExactCellId;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.quantity.AEAmount;
 import appeng.rebuild.quantity.AmountVector;
@@ -16,14 +18,37 @@ import appeng.rebuild.quantity.AmountVector;
 public final class StorageLocationSnapshot {
     private final StorageLocationId location;
     private final AmountVector amounts;
+    private final ExactCellId exactCellId;
+    private final long exactCellRevision;
 
     public StorageLocationSnapshot(StorageLocationId location, AmountVector amounts) {
+        this(location, amounts, null, 0L);
+    }
+
+    public StorageLocationSnapshot(StorageLocationId location, AmountVector amounts, ExactCellId exactCellId,
+            long exactCellRevision) {
         this.location = Objects.requireNonNull(location, "location");
         this.amounts = Objects.requireNonNull(amounts, "amounts").copy();
+        if (exactCellId == null && exactCellRevision != 0L) {
+            throw new IllegalArgumentException("A legacy location cannot carry an exact-cell revision");
+        }
+        if (exactCellRevision < 0L) {
+            throw new IllegalArgumentException("Exact-cell revision must be non-negative");
+        }
+        this.exactCellId = exactCellId;
+        this.exactCellRevision = exactCellRevision;
     }
 
     public StorageLocationId location() {
         return location;
+    }
+
+    public Optional<ExactCellId> exactCellId() {
+        return Optional.ofNullable(exactCellId);
+    }
+
+    public long exactCellRevision() {
+        return exactCellRevision;
     }
 
     public int size() {
@@ -59,6 +84,8 @@ public final class StorageLocationSnapshot {
             return true;
         }
         if (!(obj instanceof StorageLocationSnapshot other) || !location.equals(other.location)
+                || !Objects.equals(exactCellId, other.exactCellId)
+                || exactCellRevision != other.exactCellRevision
                 || amounts.nonZeroSize() != other.amounts.nonZeroSize()) {
             return false;
         }
@@ -75,6 +102,8 @@ public final class StorageLocationSnapshot {
     @Override
     public int hashCode() {
         int result = location.hashCode();
+        result = 31 * result + Objects.hashCode(exactCellId);
+        result = 31 * result + Long.hashCode(exactCellRevision);
         for (int index = 0; index < amounts.size(); index++) {
             AEAmount amount = amounts.get(index);
             if (!amount.equals(AEAmount.ZERO)) {
