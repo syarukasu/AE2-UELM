@@ -417,6 +417,52 @@ class ExactTransferBrokerTest {
     }
 
     @Test
+    void invalidModulateExtractReturnsFailClosedTransferEvidenceAndBlocksFutureOperations() {
+        for (TransferStep invalid : List.of(TransferStep.nullReturning(), TransferStep.unboundedReturning(),
+                TransferStep.overReturning())) {
+            PlanFixture fixture = plan("broker-extract-invalid-" + invalid.kind(),
+                    Map.of(0, AEAmount.of(3L), 1, AEAmount.of(5L)));
+            ScriptedStorage storage = new ScriptedStorage(fixture.storage(), fixture.plan().initialStorageDebits());
+            storage.extractSteps.add(TransferStep.exact());
+            storage.extractSteps.add(invalid);
+            ExactCpuLedger ledger = new ExactCpuLedger();
+            CpuPlanHandle handle = prepare(ledger, fixture.plan());
+            ExactTransferBroker broker = broker(storage, fixture.patterns());
+
+            ExactTransferBrokerResult.Failure failed = assertInstanceOf(ExactTransferBrokerResult.Failure.class,
+                    broker.reserve(ledger, handle));
+
+            assertEquals(ExactTransferBrokerResult.FailureReason.INVARIANT_VIOLATION, failed.reason());
+            ExactTransferBrokerSnapshot snapshot = failed.snapshot();
+            assertEquals(ExactTransferBrokerState.FAIL_CLOSED, snapshot.state());
+            assertEquals(Optional.of(handle), snapshot.handle());
+            assertEquals(Optional.of(fixture.plan().planId()), snapshot.planId());
+            assertTrue(snapshot.reservationId().isPresent());
+            assertEquals(Map.of(new KeyId(0), AEAmount.of(3L)), snapshot.escrowed());
+
+            BrokerTransferDiscrepancy evidence = snapshot.transferDiscrepancy().orElseThrow();
+            assertEquals(BrokerTransferDiscrepancy.Operation.EXTRACT, evidence.operation());
+            assertEquals(extractReason(invalid), evidence.reason());
+            assertEquals(fixture.plan().planId(), evidence.planId());
+            assertEquals(handle, evidence.handle());
+            assertEquals(snapshot.reservationId().orElseThrow(), evidence.reservationId());
+            assertEquals(new KeyId(1), evidence.key());
+            assertEquals(AEAmount.of(5L), evidence.requested());
+            assertEquals(expectedReported(invalid, AEAmount.of(5L)), evidence.reported());
+            assertEquals(Map.of(new KeyId(0), AEAmount.of(3L)), evidence.knownEscrow());
+            assertEquals(ExactCpuLedgerState.PREPARED, ledger.snapshot().state());
+
+            int insertCalls = storage.modulateInsertCalls;
+            assertFailure(broker.progressRelease(1), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+            assertFailure(broker.cancelReservation(ledger, handle),
+                    ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+            assertFailure(broker.reserve(ledger, handle), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+            assertEquals(insertCalls, storage.modulateInsertCalls);
+            assertEquals(snapshot, broker.snapshot());
+        }
+    }
+
+    @Test
     void releaseOverReturnFailsClosedAndRetainsKnownCustody() {
         PlanFixture fixture = plan("broker-over-return", Map.of(0, AEAmount.of(10L)));
         ScriptedStorage storage = new ScriptedStorage(fixture.storage(), fixture.plan().initialStorageDebits());
@@ -432,9 +478,68 @@ class ExactTransferBrokerTest {
         ExactTransferBrokerSnapshot failed = broker.snapshot();
         assertEquals(ExactTransferBrokerState.FAIL_CLOSED, failed.state());
         assertEquals(Map.of(new KeyId(0), AEAmount.of(10L)), failed.escrowed());
+        BrokerTransferDiscrepancy evidence = failed.transferDiscrepancy().orElseThrow();
+        assertEquals(BrokerTransferDiscrepancy.Operation.INSERT, evidence.operation());
+        assertEquals(BrokerTransferDiscrepancy.Reason.OUT_OF_RANGE_RETURN, evidence.reason());
+        assertEquals(fixture.plan().planId(), evidence.planId());
+        assertEquals(handle, evidence.handle());
+        assertEquals(failed.reservationId().orElseThrow(), evidence.reservationId());
+        assertEquals(new KeyId(0), evidence.key());
+        assertEquals(AEAmount.of(10L), evidence.requested());
+        assertEquals(Optional.of(AEAmount.of(11L)), evidence.reported());
+        assertEquals(Map.of(new KeyId(0), AEAmount.of(10L)), evidence.knownEscrow());
         assertEquals(ExactCpuLedgerState.RELEASE_PENDING, ledger.snapshot().state());
         assertFailure(broker.progressRelease(1), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
         assertSnapshotEquals(failed, broker.snapshot());
+    }
+
+    @Test
+    void nullAndUnboundedReleaseReturnsRetainTypedEvidenceBeforeCpuAcknowledgement() {
+        for (TransferStep invalid : List.of(TransferStep.nullReturning(), TransferStep.unboundedReturning())) {
+            PlanFixture fixture = plan("broker-release-invalid-" + invalid.kind(), Map.of(0, AEAmount.of(10L)));
+            ScriptedStorage storage = new ScriptedStorage(fixture.storage(), fixture.plan().initialStorageDebits());
+            ExactCpuLedger ledger = new ExactCpuLedger();
+            CpuPlanHandle handle = prepare(ledger, fixture.plan());
+            ExactTransferBroker broker = broker(storage, fixture.patterns());
+            assertInstanceOf(ExactTransferBrokerResult.Reserved.class, broker.reserve(ledger, handle));
+            storage.insertSteps.add(invalid);
+
+            ExactTransferBrokerResult.Failure failed = assertInstanceOf(ExactTransferBrokerResult.Failure.class,
+                    broker.cancelReservation(ledger, handle));
+            assertEquals(ExactTransferBrokerResult.FailureReason.INVARIANT_VIOLATION, failed.reason());
+            ExactTransferBrokerSnapshot snapshot = failed.snapshot();
+            assertEquals(ExactTransferBrokerState.FAIL_CLOSED, snapshot.state());
+            assertEquals(ExactCpuLedgerState.RELEASE_PENDING, ledger.snapshot().state());
+            BrokerTransferDiscrepancy evidence = snapshot.transferDiscrepancy().orElseThrow();
+            assertEquals(BrokerTransferDiscrepancy.Operation.INSERT, evidence.operation());
+            assertEquals(extractReason(invalid), evidence.reason());
+            assertEquals(fixture.plan().planId(), evidence.planId());
+            assertEquals(handle, evidence.handle());
+            assertEquals(snapshot.reservationId().orElseThrow(), evidence.reservationId());
+            assertEquals(new KeyId(0), evidence.key());
+            assertEquals(AEAmount.of(10L), evidence.requested());
+            assertEquals(Optional.empty(), evidence.reported());
+            assertEquals(Map.of(new KeyId(0), AEAmount.of(10L)), evidence.knownEscrow());
+
+            int insertCalls = storage.modulateInsertCalls;
+            assertFailure(broker.progressRelease(1), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+            assertEquals(insertCalls, storage.modulateInsertCalls);
+            assertEquals(snapshot, broker.snapshot());
+        }
+    }
+
+    private static BrokerTransferDiscrepancy.Reason extractReason(TransferStep step) {
+        return switch (step.kind()) {
+            case NULL_RETURN -> BrokerTransferDiscrepancy.Reason.NULL_RETURN;
+            case UNBOUNDED_RETURN -> BrokerTransferDiscrepancy.Reason.UNBOUNDED_RETURN;
+            case OVER_RETURN -> BrokerTransferDiscrepancy.Reason.OUT_OF_RANGE_RETURN;
+            default -> throw new IllegalArgumentException("not an invalid transfer step: " + step.kind());
+        };
+    }
+
+    private static Optional<AEAmount> expectedReported(TransferStep step, AEAmount requested) {
+        return step.kind() == TransferKind.OVER_RETURN ? Optional.of(requested.add(AEAmount.ONE))
+                : Optional.empty();
     }
 
     private static ExactTransferBroker broker(ScriptedStorage storage, NormalizedPatternSnapshot patterns) {
@@ -457,6 +562,7 @@ class ExactTransferBrokerTest {
         assertEquals(expected.planId(), actual.planId());
         assertEquals(expected.reservationId(), actual.reservationId());
         assertEquals(expected.escrowed(), actual.escrowed());
+        assertEquals(expected.transferDiscrepancy(), actual.transferDiscrepancy());
     }
 
     private static PlanFixture plan(String id, Map<Integer, AEAmount> requestedDebits) {
@@ -510,7 +616,9 @@ class ExactTransferBrokerTest {
         EXACT,
         RETURN,
         THROW,
-        OVER_RETURN
+        OVER_RETURN,
+        NULL_RETURN,
+        UNBOUNDED_RETURN
     }
 
     private record TransferStep(TransferKind kind, AEAmount amount) {
@@ -528,6 +636,14 @@ class ExactTransferBrokerTest {
 
         static TransferStep overReturning() {
             return new TransferStep(TransferKind.OVER_RETURN, AEAmount.ZERO);
+        }
+
+        static TransferStep nullReturning() {
+            return new TransferStep(TransferKind.NULL_RETURN, AEAmount.ZERO);
+        }
+
+        static TransferStep unboundedReturning() {
+            return new TransferStep(TransferKind.UNBOUNDED_RETURN, AEAmount.ZERO);
         }
     }
 
@@ -562,6 +678,12 @@ class ExactTransferBrokerTest {
             if (step.kind() == TransferKind.THROW) {
                 throw new IllegalStateException("scripted insert failure");
             }
+            if (step.kind() == TransferKind.NULL_RETURN) {
+                return null;
+            }
+            if (step.kind() == TransferKind.UNBOUNDED_RETURN) {
+                return AEAmount.of(BigInteger.ONE.shiftLeft(PlannerLimits.MAX_CRAFT_QUANTITY_BITS));
+            }
             if (step.kind() == TransferKind.OVER_RETURN) {
                 return amount.add(AEAmount.ONE);
             }
@@ -582,6 +704,12 @@ class ExactTransferBrokerTest {
             TransferStep step = extractSteps.isEmpty() ? TransferStep.exact() : extractSteps.removeFirst();
             if (step.kind() == TransferKind.THROW) {
                 throw new IllegalStateException("scripted extract failure");
+            }
+            if (step.kind() == TransferKind.NULL_RETURN) {
+                return null;
+            }
+            if (step.kind() == TransferKind.UNBOUNDED_RETURN) {
+                return AEAmount.of(BigInteger.ONE.shiftLeft(PlannerLimits.MAX_CRAFT_QUANTITY_BITS));
             }
             AEAmount extracted = step.kind() == TransferKind.RETURN ? step.amount() : amount;
             if (step.kind() == TransferKind.OVER_RETURN) {

@@ -5,6 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.mockStatic;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -19,6 +22,7 @@ import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
 
 import appeng.api.config.Actionable;
 import appeng.api.networking.security.IActionSource;
@@ -103,6 +107,54 @@ class ExactWorkOrderHandoffTest {
         assertEquals(transfersBeforeStart, storage.totalTransferCalls());
         assertEquals(AEAmount.ZERO, storage.physical(new KeyId(0)));
         assertEquals(AEAmount.ZERO, storage.physical(new KeyId(1)));
+    }
+
+    @Test
+    void materializationRuntimeFailureAfterCpuHandoffFailsClosedWithLeaseAndEscrowEvidence() {
+        PlanFixture fixture = plan("handoff-materialization-failure", Map.of(0, AEAmount.of(7L)));
+        CountingStorage storage = new CountingStorage(fixture.storage(), fixture.plan().initialStorageDebits());
+        TestGate gate = new TestGate();
+        ExactTransferBroker broker = broker(storage, fixture.patterns(), gate);
+        ExactCpuLedger ledger = new ExactCpuLedger();
+        CpuPlanHandle handle = prepare(ledger, fixture.plan());
+        ExactTransferBrokerResult.Reserved reserved = assertInstanceOf(ExactTransferBrokerResult.Reserved.class,
+                broker.reserve(ledger, handle));
+        ReservationId reservationId = reserved.snapshot().reservationId().orElseThrow();
+
+        ExactTransferBrokerResult.Failure failed;
+        try (MockedStatic<ExactWorkOrder> workOrder = mockStatic(ExactWorkOrder.class, CALLS_REAL_METHODS)) {
+            workOrder.when(() -> ExactWorkOrder.fromStaged(any(WorkOrderId.class), any(ReservedPlanLease.class),
+                    any(Map.class), any(BrokerExactStorage.class), any(ServerThreadGate.class),
+                    any(IActionSource.class), any(ExactCpuLedger.class), any(ExactTransferBroker.class)))
+                    .thenThrow(new IllegalStateException("synthetic materialization failure"));
+            failed = assertInstanceOf(ExactTransferBrokerResult.Failure.class,
+                    broker.startWorkOrder(ledger, handle));
+        }
+
+        assertEquals(ExactTransferBrokerResult.FailureReason.INVARIANT_VIOLATION, failed.reason());
+        ExactTransferBrokerSnapshot snapshot = failed.snapshot();
+        assertEquals(ExactTransferBrokerState.FAIL_CLOSED, snapshot.state());
+        assertEquals(Optional.of(handle), snapshot.handle());
+        assertEquals(Optional.of(fixture.plan().planId()), snapshot.planId());
+        assertEquals(Optional.of(reservationId), snapshot.reservationId());
+        assertTrue(snapshot.workOrderId().isPresent());
+        assertTrue(snapshot.leaseIdentity().isPresent());
+        assertEquals(fixture.plan().initialStorageDebits(), snapshot.escrowed());
+        assertTrue(snapshot.transferDiscrepancy().isEmpty());
+        ReservedPlanLease retainedLease = broker.handoffFailureLease().orElseThrow();
+        assertEquals(fixture.plan(), retainedLease.plan());
+        assertEquals(handle, retainedLease.handle());
+        assertEquals(reservationId, retainedLease.reservationId());
+        assertEquals(snapshot.leaseIdentity().orElseThrow(), retainedLease.leaseIdentity());
+        assertEquals(ExactCpuLedgerState.HANDED_OFF, ledger.snapshot().state());
+        assertEquals(Optional.of(snapshot.leaseIdentity().orElseThrow()), ledger.snapshot().leaseIdentity());
+
+        int insertCalls = storage.modulateInsertCalls;
+        assertFailure(broker.progressRelease(1), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+        assertFailure(broker.cancelReservation(ledger, handle), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+        assertFailure(broker.reserve(ledger, handle), ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+        assertEquals(insertCalls, storage.modulateInsertCalls, "fail-closed handoff must not duplicate release");
+        assertEquals(snapshot, broker.snapshot());
     }
 
     @Test
@@ -315,6 +367,7 @@ class ExactWorkOrderHandoffTest {
         assertEquals(expected.workOrderId(), actual.workOrderId());
         assertEquals(expected.leaseIdentity(), actual.leaseIdentity());
         assertEquals(expected.escrowed(), actual.escrowed());
+        assertEquals(expected.transferDiscrepancy(), actual.transferDiscrepancy());
     }
 
     private static PlanFixture plan(String id, Map<Integer, AEAmount> requestedDebits) {

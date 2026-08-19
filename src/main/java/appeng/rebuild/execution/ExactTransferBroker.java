@@ -40,6 +40,8 @@ public final class ExactTransferBroker {
     private ReservationId reservationId;
     private WorkOrderId workOrderId;
     private UUID leaseIdentity;
+    private BrokerTransferDiscrepancy transferDiscrepancy;
+    private ReservedPlanLease handoffFailureLease;
     private final TreeMap<KeyId, AEAmount> escrowed = new TreeMap<>(Comparator.comparingInt(KeyId::value));
 
     public ExactTransferBroker(BrokerExactStorage storage, CurrentPatternSnapshotSource patternSnapshots,
@@ -116,7 +118,8 @@ public final class ExactTransferBroker {
                     return startRollback(ExactTransferBrokerResult.FailureReason.STORAGE_FAILURE);
                 }
                 if (!validMovedAmount(extracted, debit.getValue())) {
-                    return failClosed();
+                    return retainTransferDiscrepancy(BrokerTransferDiscrepancy.Operation.EXTRACT, debit.getKey(),
+                            debit.getValue(), extracted);
                 }
                 if (!extracted.equals(AEAmount.ZERO)) {
                     escrowed.put(debit.getKey(), extracted);
@@ -249,6 +252,9 @@ public final class ExactTransferBroker {
                 // instead.
                 retainHandoffFailure(stagedWorkOrderId, lease);
                 throw fatal;
+            } catch (RuntimeException failure) {
+                retainHandoffFailure(stagedWorkOrderId, lease);
+                return failure(ExactTransferBrokerResult.FailureReason.INVARIANT_VIOLATION);
             }
         } finally {
             endOperation();
@@ -285,7 +291,15 @@ public final class ExactTransferBroker {
         return new ExactTransferBrokerSnapshot(state, Optional.ofNullable(handle), Optional.ofNullable(planId),
                 Optional.ofNullable(reservationId), Optional.ofNullable(workOrderId),
                 Optional.ofNullable(leaseIdentity),
-                escrowed);
+                escrowed, Optional.ofNullable(transferDiscrepancy));
+    }
+
+    /**
+     * Read-only admission check for aggregate recovery capture. The caller must remain on the server thread and must
+     * not invoke capture from an operational callback; capture itself never acquires a broker operation permit.
+     */
+    synchronized boolean recoveryCaptureAllowed() {
+        return !entered && onServerThread();
     }
 
     private ExactTransferBrokerResult startRollback(ExactTransferBrokerResult.FailureReason reason) {
@@ -312,7 +326,8 @@ public final class ExactTransferBroker {
                 continue;
             }
             if (!validMovedAmount(inserted, requested)) {
-                return failClosed();
+                return retainTransferDiscrepancy(BrokerTransferDiscrepancy.Operation.INSERT, entry.getKey(), requested,
+                        inserted);
             }
             if (inserted.equals(requested)) {
                 escrowed.remove(entry.getKey());
@@ -345,6 +360,8 @@ public final class ExactTransferBroker {
         reservationId = ReservationId.fresh();
         workOrderId = null;
         leaseIdentity = null;
+        transferDiscrepancy = null;
+        handoffFailureLease = null;
         escrowed.clear();
     }
 
@@ -421,6 +438,25 @@ public final class ExactTransferBroker {
         return failure(ExactTransferBrokerResult.FailureReason.INVARIANT_VIOLATION);
     }
 
+    private ExactTransferBrokerResult retainTransferDiscrepancy(BrokerTransferDiscrepancy.Operation operation,
+            KeyId key, AEAmount requested, AEAmount returned) {
+        BrokerTransferDiscrepancy.Reason reason;
+        Optional<AEAmount> reported = Optional.empty();
+        if (returned == null) {
+            reason = BrokerTransferDiscrepancy.Reason.NULL_RETURN;
+        } else if (returned.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS) {
+            reason = BrokerTransferDiscrepancy.Reason.UNBOUNDED_RETURN;
+        } else {
+            reason = BrokerTransferDiscrepancy.Reason.OUT_OF_RANGE_RETURN;
+            if (!returned.equals(AEAmount.ZERO))
+                reported = Optional.of(returned);
+        }
+        transferDiscrepancy = new BrokerTransferDiscrepancy(operation, reason, planId, handle, reservationId, key,
+                requested, reported, escrowed);
+        state = ExactTransferBrokerState.FAIL_CLOSED;
+        return failure(ExactTransferBrokerResult.FailureReason.INVARIANT_VIOLATION);
+    }
+
     private ExactTransferBrokerResult.Failure failure(ExactTransferBrokerResult.FailureReason reason) {
         return new ExactTransferBrokerResult.Failure(reason, snapshot());
     }
@@ -432,6 +468,8 @@ public final class ExactTransferBroker {
         reservationId = null;
         workOrderId = null;
         leaseIdentity = null;
+        transferDiscrepancy = null;
+        handoffFailureLease = null;
         escrowed.clear();
         state = ExactTransferBrokerState.IDLE;
     }
@@ -481,7 +519,13 @@ public final class ExactTransferBroker {
     private void retainHandoffFailure(WorkOrderId stagedWorkOrderId, ReservedPlanLease lease) {
         workOrderId = stagedWorkOrderId;
         leaseIdentity = lease.leaseIdentity();
+        handoffFailureLease = lease;
         state = ExactTransferBrokerState.FAIL_CLOSED;
+    }
+
+    /** Package persistence seam for the actual immutable lease retained after an irreversible handoff failure. */
+    synchronized Optional<ReservedPlanLease> handoffFailureLease() {
+        return Optional.ofNullable(handoffFailureLease);
     }
 
     private static Map<KeyId, AEAmount> sorted(Map<KeyId, AEAmount> amounts) {
