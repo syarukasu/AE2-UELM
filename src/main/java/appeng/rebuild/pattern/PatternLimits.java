@@ -31,6 +31,14 @@ public final class PatternLimits {
     public static final int MAX_PATTERN_PROVIDER_PATTERNS = 65_536;
     /** Maximum input candidates staged by one provider reload. */
     public static final int MAX_PATTERN_PROVIDER_TOTAL_INPUT_CANDIDATES = 65_536;
+    /** Maximum distinct normalized patterns retained by one grid shadow snapshot. */
+    public static final int MAX_NORMALIZED_PATTERNS_PER_GRID = 65_536;
+    /** Maximum provider occurrences inspected by one grid shadow build. */
+    public static final int MAX_NORMALIZED_PATTERN_PROVIDERS_PER_GRID = 65_536;
+    /** Maximum eligible provider-to-pattern bindings inspected by one grid shadow build. */
+    public static final int MAX_NORMALIZED_PATTERN_BINDINGS_PER_GRID = 65_536;
+    /** Maximum deterministic diagnostic entries retained by one grid shadow snapshot. */
+    public static final int MAX_NORMALIZED_PATTERN_DIAGNOSTICS = 64;
 
     private PatternLimits() {
     }

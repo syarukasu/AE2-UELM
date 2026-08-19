@@ -40,6 +40,11 @@ public final class LegacyPatternNormalizer {
         this.keyRegistry = Objects.requireNonNull(keyRegistry, "keyRegistry");
     }
 
+    /** Returns the key-registry generation assigned to all successful compiled patterns. */
+    public long keyRegistryGeneration() {
+        return keyRegistry.generation();
+    }
+
     /**
      * Normalizes a built-in pattern on its owning server thread. All legacy callbacks run before the first registry
      * mutation; runtime failures from those callbacks become bounded typed failures.

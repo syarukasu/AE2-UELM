@@ -85,6 +85,7 @@ import appeng.init.internal.InitUpgrades;
 import appeng.init.worldgen.InitStructures;
 import appeng.integration.Integrations;
 import appeng.items.tools.MemoryCardItem;
+import appeng.me.service.CraftingService;
 import appeng.rebuild.pattern.RecipeReloadCoordinator;
 import appeng.recipes.AERecipeTypes;
 import appeng.server.AECommand;
@@ -164,6 +165,7 @@ public abstract class AppEngBase implements AppEng {
 
         TickHandler.instance().init();
 
+        CraftingService.bindRecipeReloadFailureObserver();
         MinecraftForge.EVENT_BUS.addListener(this::onServerAboutToStart);
         MinecraftForge.EVENT_BUS.addListener(this::serverStopped);
         MinecraftForge.EVENT_BUS.addListener(this::serverStopping);

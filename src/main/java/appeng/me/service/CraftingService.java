@@ -24,6 +24,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -72,11 +73,19 @@ import appeng.crafting.CraftingLink;
 import appeng.crafting.CraftingLinkNexus;
 import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.hooks.ticking.TickHandler;
+import appeng.me.Grid;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
 import appeng.me.helpers.InterestManager;
 import appeng.me.helpers.StackWatcher;
 import appeng.me.service.helpers.CraftingServiceStorage;
 import appeng.me.service.helpers.NetworkCraftingProviders;
+import appeng.rebuild.pattern.GridRecipeRevisionChanged;
+import appeng.rebuild.pattern.LegacyPatternNormalizer;
+import appeng.rebuild.pattern.NormalizedPatternBuildResult;
+import appeng.rebuild.pattern.NormalizedPatternShadowState;
+import appeng.rebuild.pattern.NormalizedPatternSnapshot;
+import appeng.rebuild.pattern.RecipeReloadCoordinator;
+import appeng.rebuild.pattern.RecipeReloadState;
 
 public class CraftingService implements ICraftingService, IGridServiceProvider {
 
@@ -97,6 +106,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             .thenComparingLong(CraftingCPUCluster::getAvailableStorage);
 
     private static final ExecutorService CRAFTING_POOL;
+    private static boolean recipeReloadFailureObserverBound;
 
     static {
         final ThreadFactory factory = ar -> {
@@ -111,12 +121,16 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
                 (service, event) -> {
                     ((CraftingService) service).updateList = true;
                 });
+        GridHelper.addGridServiceEventHandler(GridRecipeRevisionChanged.class, ICraftingService.class,
+                (service, event) -> ((CraftingService) service).onRecipeRevisionChanged(event));
     }
 
     private final Set<CraftingCPUCluster> craftingCPUClusters = new HashSet<>();
     private final Map<IGridNode, StackWatcher<ICraftingWatcherNode>> craftingWatchers = new HashMap<>();
     private final IGrid grid;
     private final NetworkCraftingProviders craftingProviders = new NetworkCraftingProviders();
+    private final LegacyPatternNormalizer patternNormalizer;
+    private NormalizedPatternShadowState normalizedPatternShadow;
     private final Map<UUID, CraftingLinkNexus> craftingLinks = new HashMap<>();
     private final Multimap<AEKey, StackWatcher<ICraftingWatcherNode>> interests = HashMultimap.create();
     private final InterestManager<StackWatcher<ICraftingWatcherNode>> interestManager = new InterestManager<>(
@@ -131,6 +145,13 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
     public CraftingService(IGrid grid, IStorageService storageGrid, IEnergyService energyGrid) {
         this.grid = grid;
         this.energyGrid = energyGrid;
+        if (!(storageGrid instanceof StorageService storageService)) {
+            throw new IllegalArgumentException("CraftingService requires the concrete StorageService");
+        }
+        this.patternNormalizer = new LegacyPatternNormalizer(storageService.getExactStorage().keyRegistry());
+        bindRecipeReloadFailureObserver();
+        RecipeReloadState reloadState = RecipeReloadCoordinator.instance().currentState();
+        this.normalizedPatternShadow = initialShadowState(reloadState);
         this.lastProcessedCraftingLogicChangeTick = TickHandler.instance().getCurrentTick();
         this.lastProcessedCraftableChangeTick = TickHandler.instance().getCurrentTick();
 
@@ -139,6 +160,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
 
     @Override
     public void onServerEndTick() {
+        rebuildNormalizedPatternShadow();
         if (this.updateList) {
             this.updateList = false;
             this.updateCPUClusters();
@@ -232,6 +254,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         }
 
         this.craftingProviders.removeProvider(gridNode);
+        markNormalizedPatternShadowDirty();
 
         if (gridNode.getOwner() instanceof CraftingBlockEntity) {
             this.updateList = true;
@@ -245,6 +268,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         // in which it might already register itself before coming to this point.
         this.craftingProviders.removeProvider(gridNode);
         this.craftingProviders.addProvider(gridNode);
+        markNormalizedPatternShadowDirty();
 
         var watchingNode = gridNode.getService(ICraftingWatcherNode.class);
         if (watchingNode != null) {
@@ -319,6 +343,115 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
     public void refreshNodeCraftingProvider(IGridNode node) {
         this.craftingProviders.removeProvider(node);
         this.craftingProviders.addProvider(node);
+        markNormalizedPatternShadowDirty();
+    }
+
+    /** Immutable observational state for later Rebuild planner integration and server-thread tests. */
+    public NormalizedPatternShadowState getNormalizedPatternShadowState() {
+        return normalizedPatternShadow;
+    }
+
+    /** Returns the current immutable shadow only when its most recent build completed successfully. */
+    public Optional<NormalizedPatternSnapshot> getNormalizedPatternSnapshot() {
+        return normalizedPatternShadow.snapshot();
+    }
+
+    /** Installs the process-wide grid failure router once during inactive bootstrap. */
+    public static void bindRecipeReloadFailureObserver() {
+        if (!recipeReloadFailureObserverBound) {
+            RecipeReloadCoordinator.instance().setFailureObserver(CraftingService::disableFailedGridShadow);
+            recipeReloadFailureObserverBound = true;
+        }
+    }
+
+    private static void disableFailedGridShadow(Grid grid, GridRecipeRevisionChanged event, RuntimeException failure) {
+        var service = grid.getService(ICraftingService.class);
+        if (service instanceof CraftingService craftingService) {
+            craftingService.disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.DELIVERY_FAILURE,
+                    "event-delivery");
+        }
+    }
+
+    private static NormalizedPatternShadowState initialShadowState(RecipeReloadState reloadState) {
+        NormalizedPatternShadowState.Status status = reloadState.active() && !reloadState.failClosed()
+                ? NormalizedPatternShadowState.Status.DIRTY
+                : NormalizedPatternShadowState.Status.DISABLED;
+        return new NormalizedPatternShadowState(status, reloadState.serverGeneration(), reloadState.currentRevision(),
+                Optional.empty(), Optional.empty());
+    }
+
+    private void onRecipeRevisionChanged(GridRecipeRevisionChanged event) {
+        NormalizedPatternShadowState previous = normalizedPatternShadow;
+        if (event.serverGeneration() < previous.serverGeneration()
+                || event.serverGeneration() == previous.serverGeneration()
+                        && event.revision().value() < previous.recipeRevision().value()) {
+            disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.STALE_REVISION, "stale-event");
+            return;
+        }
+        normalizedPatternShadow = new NormalizedPatternShadowState(NormalizedPatternShadowState.Status.DIRTY,
+                event.serverGeneration(), event.revision(), Optional.empty(), Optional.empty());
+    }
+
+    private void markNormalizedPatternShadowDirty() {
+        RecipeReloadState reloadState = RecipeReloadCoordinator.instance().currentState();
+        if (!reloadState.active() || reloadState.failClosed()) {
+            normalizedPatternShadow = initialShadowState(reloadState);
+            return;
+        }
+        normalizedPatternShadow = new NormalizedPatternShadowState(NormalizedPatternShadowState.Status.DIRTY,
+                reloadState.serverGeneration(), reloadState.currentRevision(), Optional.empty(), Optional.empty());
+    }
+
+    private void rebuildNormalizedPatternShadow() {
+        NormalizedPatternShadowState target = normalizedPatternShadow;
+        if (target.status() != NormalizedPatternShadowState.Status.DIRTY) {
+            return;
+        }
+        if (!matchesCoordinatorState(target, RecipeReloadCoordinator.instance().currentState())) {
+            disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.COORDINATOR_STATE,
+                    "coordinator-before-build");
+            return;
+        }
+        try {
+            NormalizedPatternBuildResult result = craftingProviders.buildNormalizedPatternSnapshot(
+                    target.serverGeneration(), target.recipeRevision(), patternNormalizer);
+            if (result instanceof NormalizedPatternBuildResult.Success success) {
+                if (normalizedPatternShadow != target) {
+                    return;
+                }
+                if (!matchesCoordinatorState(target, RecipeReloadCoordinator.instance().currentState())) {
+                    disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.COORDINATOR_STATE,
+                            "coordinator-after-build");
+                    return;
+                }
+                normalizedPatternShadow = new NormalizedPatternShadowState(NormalizedPatternShadowState.Status.ACTIVE,
+                        success.snapshot().serverGeneration(), success.snapshot().recipeRevision(),
+                        Optional.of(success.snapshot()), Optional.empty());
+            } else {
+                disableNormalizedPatternShadow(((NormalizedPatternBuildResult.Failure) result).reason(),
+                        ((NormalizedPatternBuildResult.Failure) result).context());
+            }
+        } catch (RuntimeException exception) {
+            disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.LEGACY_EXCEPTION,
+                    "shadow-build");
+        } catch (Error fatal) {
+            disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.LEGACY_EXCEPTION,
+                    "shadow-fatal");
+            throw fatal;
+        }
+    }
+
+    private static boolean matchesCoordinatorState(NormalizedPatternShadowState target, RecipeReloadState state) {
+        return state.active() && !state.failClosed() && state.pendingRevision().isEmpty()
+                && state.serverGeneration() == target.serverGeneration()
+                && state.currentRevision().equals(target.recipeRevision());
+    }
+
+    private void disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason reason, String context) {
+        NormalizedPatternShadowState previous = normalizedPatternShadow;
+        normalizedPatternShadow = new NormalizedPatternShadowState(NormalizedPatternShadowState.Status.DISABLED,
+                previous.serverGeneration(), previous.recipeRevision(), Optional.empty(),
+                Optional.of(new NormalizedPatternBuildResult.Failure(reason, context)));
     }
 
     @Nullable
