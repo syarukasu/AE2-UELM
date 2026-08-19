@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -41,6 +42,7 @@ import org.apache.commons.lang3.mutable.MutableObject;
 import org.jetbrains.annotations.Nullable;
 
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 
 import appeng.api.config.Actionable;
@@ -71,6 +73,7 @@ import appeng.blockentity.crafting.CraftingBlockEntity;
 import appeng.crafting.CraftingCalculation;
 import appeng.crafting.CraftingLink;
 import appeng.crafting.CraftingLinkNexus;
+import appeng.crafting.ExactCraftingPlanAdapter;
 import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.hooks.ticking.TickHandler;
 import appeng.me.Grid;
@@ -79,6 +82,12 @@ import appeng.me.helpers.InterestManager;
 import appeng.me.helpers.StackWatcher;
 import appeng.me.service.helpers.CraftingServiceStorage;
 import appeng.me.service.helpers.NetworkCraftingProviders;
+import appeng.rebuild.execution.ExactCpuLedgerState;
+import appeng.rebuild.execution.ExactCraftingPlanValidator;
+import appeng.rebuild.execution.ExactPlanValidationResult;
+import appeng.rebuild.execution.ExactTransferBrokerState;
+import appeng.rebuild.key.KeyId;
+import appeng.rebuild.pattern.CompiledPattern;
 import appeng.rebuild.pattern.GraphGeneration;
 import appeng.rebuild.pattern.GridRecipeRevisionChanged;
 import appeng.rebuild.pattern.LegacyPatternNormalizer;
@@ -87,6 +96,12 @@ import appeng.rebuild.pattern.NormalizedPatternShadowState;
 import appeng.rebuild.pattern.NormalizedPatternSnapshot;
 import appeng.rebuild.pattern.RecipeReloadCoordinator;
 import appeng.rebuild.pattern.RecipeReloadState;
+import appeng.rebuild.planner.ExactCraftPlanResult;
+import appeng.rebuild.planner.ExactCraftPlanner;
+import appeng.rebuild.planner.ExactCraftRequest;
+import appeng.rebuild.quantity.AEAmount;
+import appeng.rebuild.storage.StorageSnapshot;
+import appeng.rebuild.storage.StorageSnapshotCaptureResult;
 
 public class CraftingService implements ICraftingService, IGridServiceProvider {
 
@@ -129,6 +144,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
     private final Set<CraftingCPUCluster> craftingCPUClusters = new HashSet<>();
     private final Map<IGridNode, StackWatcher<ICraftingWatcherNode>> craftingWatchers = new HashMap<>();
     private final IGrid grid;
+    private final StorageService storageService;
     private final NetworkCraftingProviders craftingProviders = new NetworkCraftingProviders();
     private final LegacyPatternNormalizer patternNormalizer;
     private NormalizedPatternShadowState normalizedPatternShadow;
@@ -151,6 +167,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         if (!(storageGrid instanceof StorageService storageService)) {
             throw new IllegalArgumentException("CraftingService requires the concrete StorageService");
         }
+        this.storageService = storageService;
         this.patternNormalizer = new LegacyPatternNormalizer(storageService.getExactStorage().keyRegistry());
         bindRecipeReloadFailureObserver();
         RecipeReloadState reloadState = RecipeReloadCoordinator.instance().currentState();
@@ -175,7 +192,12 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
 
         long latestChange = 0;
         for (var cpu : this.craftingCPUClusters) {
-            cpu.craftingLogic.tickCraftingLogic(energyGrid, this);
+            activatePendingExactRecovery(cpu);
+            if (cpu.hasExactExecution()) {
+                cpu.tickExactExecution(energyGrid, this);
+            } else {
+                cpu.craftingLogic.tickCraftingLogic(energyGrid, this);
+            }
             latestChange = Math.max(
                     latestChange,
                     cpu.craftingLogic.getLastModifiedOnTick());
@@ -360,6 +382,22 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         return normalizedPatternShadow.snapshot();
     }
 
+    /**
+     * Resolves a physical provider binding only while the normalized compiled pattern remains byte-for-byte current.
+     */
+    public @Nullable NetworkCraftingProviders.ExactPatternBinding getExactBinding(CompiledPattern sealedPattern) {
+        NormalizedPatternSnapshot snapshot = getNormalizedPatternSnapshot().orElse(null);
+        if (snapshot == null || !sealedPattern.equals(snapshot.patternsById().get(sealedPattern.id()))) {
+            return null;
+        }
+        return craftingProviders.getExactBinding(sealedPattern.id(), sealedPattern.revision());
+    }
+
+    /** Registry shared by the native storage, normalized patterns and exact CPU runtime. */
+    public appeng.rebuild.key.KeyRegistry getExactKeyRegistry() {
+        return storageService.getExactStorage().keyRegistry();
+    }
+
     /** Installs the process-wide grid failure router once during inactive bootstrap. */
     public static void bindRecipeReloadFailureObserver() {
         if (!recipeReloadFailureObserverBound) {
@@ -482,10 +520,92 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             throw new IllegalArgumentException("Invalid Crafting Job Request");
         }
 
-        final CraftingCalculation job = new CraftingCalculation(level, grid, simRequester,
-                new GenericStack(what, amount), strategy);
+        ExactCalculationInput exact = captureExactCalculation(what, AEAmount.of(amount));
+        if (exact != null) {
+            return CompletableFuture.supplyAsync(() -> calculateExact(what, amount, exact), CRAFTING_POOL);
+        }
 
-        return CRAFTING_POOL.submit(job::run);
+        final CraftingCalculation legacyJob = new CraftingCalculation(level, grid, simRequester,
+                new GenericStack(what, amount), strategy);
+        return CRAFTING_POOL.submit(legacyJob::run);
+    }
+
+    /** Pure BigInteger-capable planning entry point for exact API and packet integrations. */
+    public Future<ExactPlanValidationResult> beginExactCraftingCalculation(AEKey what, AEAmount amount) {
+        ExactCalculationInput input = captureExactCalculation(what, amount);
+        if (input == null) {
+            return CompletableFuture.completedFuture(
+                    new ExactPlanValidationResult.Failure(ExactPlanValidationResult.FailureReason.MALFORMED_PATTERN));
+        }
+        return CompletableFuture.supplyAsync(() -> calculateAndValidate(input), CRAFTING_POOL);
+    }
+
+    /** Submits a previously sealed exact plan through the same native CPU path used by crafting terminals. */
+    public ICraftingSubmitResult submitExactPlan(appeng.rebuild.execution.ExactCraftingPlan plan,
+            @Nullable ICraftingCPU target, IActionSource source) {
+        try {
+            ExactCraftingPlanAdapter adapter = new ExactCraftingPlanAdapter(plan,
+                    storageService.getExactStorage().keyRegistry(), id -> {
+                        var pattern = plan.executionManifests().stream()
+                                .flatMap(manifest -> manifest.patternExecutions().stream())
+                                .map(execution -> execution.pattern())
+                                .filter(compiled -> compiled.id().equals(id))
+                                .findFirst().orElse(null);
+                        if (pattern == null) {
+                            return null;
+                        }
+                        var binding = getExactBinding(pattern);
+                        return binding == null ? null : binding.details();
+                    });
+            return submitJob(adapter, null, target, true, source);
+        } catch (RuntimeException invalidOrStale) {
+            return CraftingSubmitResult.INCOMPLETE_PLAN;
+        }
+    }
+
+    @Nullable
+    private ExactCalculationInput captureExactCalculation(AEKey what, AEAmount amount) {
+        if (what == null || amount == null || amount.equals(AEAmount.ZERO)) {
+            return null;
+        }
+        NormalizedPatternSnapshot patterns = getNormalizedPatternSnapshot().orElse(null);
+        KeyId output = storageService.getExactStorage().keyRegistry().lookup(what);
+        StorageSnapshotCaptureResult storageResult = storageService.getExactStorage().captureSnapshot();
+        if (patterns == null || output == null
+                || patterns.graph().producerIndex().producers(output).isEmpty()
+                || !(storageResult instanceof StorageSnapshotCaptureResult.Success storage)) {
+            return null;
+        }
+        return new ExactCalculationInput(new ExactCraftRequest(output, amount), storage.snapshot(), patterns);
+    }
+
+    private ICraftingPlan calculateExact(AEKey what, long amount, ExactCalculationInput input) {
+        ExactPlanValidationResult validation = calculateAndValidate(input);
+        if (validation instanceof ExactPlanValidationResult.Success success) {
+            try {
+                return new ExactCraftingPlanAdapter(success.plan(), storageService.getExactStorage().keyRegistry(),
+                        id -> {
+                            var binding = craftingProviders.getExactBinding(id,
+                                    input.patterns().patternsById().get(id).revision());
+                            return binding == null ? null : binding.details();
+                        });
+            } catch (RuntimeException staleBinding) {
+                // The immutable plan is safe, but it cannot be submitted after its physical binding changed.
+            }
+        }
+        return new appeng.crafting.ExactCraftingFailurePlan(what, amount);
+    }
+
+    private ExactPlanValidationResult calculateAndValidate(ExactCalculationInput input) {
+        ExactCraftPlanResult result = new ExactCraftPlanner().plan(input.request(), input.storage(), input.patterns());
+        if (result instanceof ExactCraftPlanResult.Success success) {
+            return new ExactCraftingPlanValidator().validate(success.draft(), input.storage(), input.patterns());
+        }
+        return new ExactPlanValidationResult.Failure(ExactPlanValidationResult.FailureReason.INSUFFICIENT_STORAGE);
+    }
+
+    private record ExactCalculationInput(ExactCraftRequest request, StorageSnapshot storage,
+            NormalizedPatternSnapshot patterns) {
     }
 
     @Override
@@ -513,7 +633,67 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             }
         }
 
+        if (job instanceof ExactCraftingPlanAdapter exact && requestingMachine == null) {
+            return submitExact(cpuCluster, exact, src);
+        }
         return cpuCluster.submitJob(this.grid, job, src, requestingMachine);
+    }
+
+    private ICraftingSubmitResult submitExact(CraftingCPUCluster cpu, ExactCraftingPlanAdapter plan,
+            IActionSource source) {
+        try {
+            var storage = storageService.getBrokerExactStorage(exactThreadGate(cpu));
+            var patterns = exactPatternSource();
+            cpu.prepareExactPlan(plan.exactPlan(), storage, patterns, source);
+            var prepared = cpu.getExactSessionSnapshot();
+            if (prepared == null || prepared.ledger().state() != ExactCpuLedgerState.PREPARED) {
+                return CraftingSubmitResult.CPU_BUSY;
+            }
+            cpu.reserveExactPlan();
+            var reserved = cpu.getExactSessionSnapshot();
+            if (reserved == null || reserved.broker().state() != ExactTransferBrokerState.RESERVED) {
+                cpu.discardPreparedExactPlan();
+                return CraftingSubmitResult.missingIngredient(plan.finalOutput());
+            }
+            cpu.startExactWorkOrder();
+            var started = cpu.getExactSessionSnapshot();
+            if (started == null || started.broker().state() != ExactTransferBrokerState.LEASED
+                    || started.workOrder().isEmpty()) {
+                if (started != null && started.broker().state() == ExactTransferBrokerState.RESERVED) {
+                    cpu.cancelExactReservation();
+                }
+                return CraftingSubmitResult.CPU_BUSY;
+            }
+            return CraftingSubmitResult.successful(null);
+        } catch (RuntimeException failure) {
+            try {
+                cpu.discardPreparedExactPlan();
+            } catch (RuntimeException ignored) {
+                // A durable reservation or fail-closed recovery authority must remain attached to its CPU.
+            }
+            return CraftingSubmitResult.CPU_BUSY;
+        }
+    }
+
+    private void activatePendingExactRecovery(CraftingCPUCluster cpu) {
+        if (!cpu.hasPendingExactRecovery()) {
+            return;
+        }
+        try {
+            cpu.activateExactRecovery(storageService.getBrokerExactStorage(exactThreadGate(cpu)),
+                    exactPatternSource());
+        } catch (RuntimeException ignored) {
+            // The inert checkpoint remains durable and fail-closed for a later explicit recovery attempt.
+        }
+    }
+
+    private appeng.rebuild.execution.ServerThreadGate exactThreadGate(CraftingCPUCluster cpu) {
+        return () -> cpu.getLevel() instanceof ServerLevel level && level.getServer().isSameThread();
+    }
+
+    private appeng.rebuild.execution.CurrentPatternSnapshotSource exactPatternSource() {
+        return () -> getNormalizedPatternSnapshot()
+                .orElseThrow(() -> new IllegalStateException("Normalized patterns are unavailable"));
     }
 
     @Nullable

@@ -50,8 +50,11 @@ import appeng.me.helpers.InterestManager;
 import appeng.me.helpers.StackWatcher;
 import appeng.me.storage.NetworkStorage;
 import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.api.legacy.LegacyNetworkBrokerStorage;
 import appeng.rebuild.api.legacy.LegacyStorageFacade;
+import appeng.rebuild.execution.ServerThreadGate;
 import appeng.rebuild.key.KeyRegistry;
+import appeng.rebuild.storage.BrokerExactStorage;
 import appeng.rebuild.storage.StorageServiceRebuild;
 
 public class StorageService implements IStorageService, IGridServiceProvider {
@@ -199,6 +202,14 @@ public class StorageService implements IStorageService, IGridServiceProvider {
     /** Returns the exact storage reconstruction, which rejects access while invalid or dirty. */
     public StorageServiceRebuild getExactStorage() {
         return exactStorage;
+    }
+
+    /**
+     * Returns a fail-closed, server-thread-bound exact broker endpoint over this native network's physical storage. It
+     * deliberately accepts no unbounded long projection: each physical request must fit the exact bridge window.
+     */
+    public BrokerExactStorage getBrokerExactStorage(ServerThreadGate serverThread) {
+        return new LegacyNetworkBrokerStorage(inventory, exactStorage, serverThread);
     }
 
     @Override

@@ -51,6 +51,7 @@ import appeng.rebuild.pattern.PatternLimits;
 import appeng.rebuild.pattern.PatternNormalizationResult;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadFailure;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadResult;
+import appeng.rebuild.pattern.PatternRevision;
 import appeng.rebuild.pattern.PreparedPatternProviderRecipeReload;
 import appeng.rebuild.pattern.RecipeRevision;
 
@@ -148,6 +149,31 @@ public class NetworkCraftingProviders {
     public Iterable<ICraftingProvider> getMediums(IPatternDetails key) {
         var mediumList = this.craftingMethods.get(key);
         return Objects.requireNonNullElse(mediumList, Collections.emptyList());
+    }
+
+    /**
+     * Resolves the current physical binding for a sealed rebuild pattern. The caller must still reject a busy provider
+     * and a changed normalized snapshot before issuing physical work.
+     */
+    @Nullable
+    public ExactPatternBinding getExactBinding(PatternId patternId, PatternRevision revision) {
+        Objects.requireNonNull(patternId, "patternId");
+        Objects.requireNonNull(revision, "revision");
+        for (IPatternDetails details : craftingMethods.keySet()) {
+            PatternId current = previewPatternId(details);
+            if (patternId.equals(current)) {
+                return new ExactPatternBinding(details, getMediums(details));
+            }
+        }
+        return null;
+    }
+
+    /** Current physical legacy binding used only to execute an already sealed exact command. */
+    public record ExactPatternBinding(IPatternDetails details, Iterable<ICraftingProvider> providers) {
+        public ExactPatternBinding {
+            Objects.requireNonNull(details, "details");
+            Objects.requireNonNull(providers, "providers");
+        }
     }
 
     /**

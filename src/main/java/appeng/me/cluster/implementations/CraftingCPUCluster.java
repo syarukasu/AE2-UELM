@@ -19,8 +19,10 @@
 package appeng.me.cluster.implementations;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.jetbrains.annotations.Nullable;
@@ -33,6 +35,7 @@ import net.minecraft.world.level.Level;
 
 import appeng.api.config.Actionable;
 import appeng.api.config.CpuSelectionMode;
+import appeng.api.config.PowerMultiplier;
 import appeng.api.config.Settings;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.IGridNode;
@@ -41,24 +44,35 @@ import appeng.api.networking.crafting.ICraftingCPU;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.networking.crafting.ICraftingRequester;
 import appeng.api.networking.crafting.ICraftingSubmitResult;
+import appeng.api.networking.energy.IEnergyService;
 import appeng.api.networking.events.GridCraftingCpuChange;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
+import appeng.api.stacks.KeyCounter;
 import appeng.api.util.IConfigManager;
 import appeng.blockentity.crafting.CraftingBlockEntity;
 import appeng.blockentity.crafting.CraftingMonitorBlockEntity;
+import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.execution.CraftingCpuLogic;
 import appeng.me.cluster.IAECluster;
 import appeng.me.cluster.MBCalculator;
 import appeng.me.helpers.MachineSource;
+import appeng.me.service.CraftingService;
 import appeng.me.service.StorageService;
 import appeng.rebuild.execution.CurrentPatternSnapshotSource;
 import appeng.rebuild.execution.ExactCpuExecutionSession;
+import appeng.rebuild.execution.ExactCpuLedgerState;
 import appeng.rebuild.execution.ExactCraftingPlan;
 import appeng.rebuild.execution.ExactRecoveryActivation;
 import appeng.rebuild.execution.ExactRecoveryCheckpoint;
+import appeng.rebuild.execution.ExactTransferBrokerState;
+import appeng.rebuild.execution.ExactWorkCommand;
+import appeng.rebuild.execution.ExactWorkOrderCommandResult;
+import appeng.rebuild.execution.ExactWorkOrderState;
+import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
+import appeng.rebuild.quantity.AEAmount;
 import appeng.rebuild.storage.BrokerExactStorage;
 import appeng.util.ConfigManager;
 
@@ -85,6 +99,10 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     /** Exact execution is CPU-owned; no ledger, broker, or work-order reference is exposed from this cluster. */
     @Nullable
     private ExactCpuExecutionSession exactSession;
+    @Nullable
+    private ExactWorkCommand exactInFlight;
+    private final Map<KeyId, AEAmount> exactOutputRemaining = new HashMap<>();
+    private final Map<KeyId, AEAmount> exactRemainderRemaining = new HashMap<>();
 
     public CraftingCPUCluster(BlockPos boundsMin, BlockPos boundsMax) {
         this.boundsMin = boundsMin.immutable();
@@ -175,7 +193,153 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     }
 
     public long insert(AEKey what, long amount, Actionable mode, IActionSource source) {
+        if (this.exactSession != null && this.exactInFlight != null) {
+            return insertExactResult(what, amount, mode);
+        }
         return craftingLogic.insert(what, amount, mode);
+    }
+
+    /** Advances one bounded exact physical command or one bounded settlement pass. Server thread only. */
+    public void tickExactExecution(IEnergyService energyService, CraftingService craftingService) {
+        requireExactServerThread();
+        if (exactSession == null || exactInFlight != null) {
+            return;
+        }
+        var snapshot = exactSession.snapshot();
+        if (snapshot.workOrder().isEmpty()) {
+            if (snapshot.broker().state() == ExactTransferBrokerState.ROLLBACK_PENDING
+                    || snapshot.broker().state() == ExactTransferBrokerState.RELEASE_PENDING) {
+                exactSession.progressReservationRelease(1024);
+            }
+            var after = exactSession.snapshot();
+            if (after.ledger().state() == ExactCpuLedgerState.IDLE
+                    && after.broker().state() == ExactTransferBrokerState.IDLE) {
+                exactSession = null;
+            }
+            return;
+        }
+        ExactWorkOrderState state = snapshot.workOrder().orElseThrow().state();
+        if (state == ExactWorkOrderState.SETTLEMENT_PENDING || state == ExactWorkOrderState.RELEASE_PENDING) {
+            exactSession.progressWorkRelease(1024);
+            if (exactSession.snapshot().workOrder().map(s -> s.state() == ExactWorkOrderState.COMPLETED)
+                    .orElse(false)) {
+                exactSession = null;
+            }
+            return;
+        }
+        if (state != ExactWorkOrderState.READY) {
+            return;
+        }
+        var issuedResult = exactSession.issueNext(1);
+        if (!(issuedResult instanceof ExactCpuExecutionSession.Command issued)
+                || !(issued.result() instanceof ExactWorkOrderCommandResult.Issued commandResult)) {
+            return;
+        }
+        ExactWorkCommand command = commandResult.command();
+        var binding = craftingService.getExactBinding(command.pattern());
+        if (binding == null) {
+            exactSession.rejectIssued(command);
+            exactSession.requestCancellation();
+            return;
+        }
+        KeyCounter[] inputs = exactInputs(command, craftingService.getExactKeyRegistry());
+        double power = CraftingCpuHelper.calculatePatternPower(inputs);
+        for (var provider : binding.providers()) {
+            if (provider.isBusy()
+                    || energyService.extractAEPower(power, Actionable.SIMULATE, PowerMultiplier.CONFIG) < power
+                            - 0.01) {
+                continue;
+            }
+            if (provider.pushPattern(binding.details(), inputs)) {
+                energyService.extractAEPower(power, Actionable.MODULATE, PowerMultiplier.CONFIG);
+                exactSession.acceptIssued(command);
+                exactInFlight = command;
+                exactOutputRemaining.clear();
+                exactOutputRemaining.putAll(command.expectedOutputs());
+                exactRemainderRemaining.clear();
+                exactRemainderRemaining.putAll(command.expectedRemainders());
+                markDirty();
+                return;
+            }
+        }
+        exactSession.rejectIssued(command);
+    }
+
+    public boolean hasExactExecution() {
+        return exactSession != null;
+    }
+
+    /** Discards only a plan which has not acquired physical custody. */
+    public void discardPreparedExactPlan() {
+        requireExactServerThread();
+        if (exactSession == null) {
+            return;
+        }
+        var snapshot = exactSession.snapshot();
+        if (snapshot.ledger().state() == ExactCpuLedgerState.PREPARED
+                && snapshot.broker().state() == ExactTransferBrokerState.IDLE) {
+            exactSession.discardPrepared();
+            exactSession = null;
+        }
+    }
+
+    private KeyCounter[] exactInputs(ExactWorkCommand command, KeyRegistry keys) {
+        KeyCounter[] result = new KeyCounter[command.pattern().inputs().size()];
+        for (int index = 0; index < result.length; index++) {
+            result[index] = new KeyCounter();
+        }
+        for (var selection : command.plannedSelections()) {
+            result[selection.inputIndex()].add(keys.resolve(selection.consumedKey()),
+                    selection.initialRequiredAmount().longValueExact());
+        }
+        return result;
+    }
+
+    private long insertExactResult(AEKey what, long amount, Actionable mode) {
+        if (amount <= 0) {
+            return 0;
+        }
+        KeyRegistry keys = exactKeyRegistry();
+        if (keys == null) {
+            return 0;
+        }
+        KeyId key = keys.lookup(what);
+        if (key == null) {
+            return 0;
+        }
+        AEAmount requested = AEAmount.of(amount);
+        AEAmount acceptedOutput = minimum(requested, exactOutputRemaining.getOrDefault(key, AEAmount.ZERO));
+        AEAmount left = requested.subtractExact(acceptedOutput);
+        AEAmount acceptedRemainder = minimum(left, exactRemainderRemaining.getOrDefault(key, AEAmount.ZERO));
+        AEAmount accepted = acceptedOutput.add(acceptedRemainder);
+        if (mode == Actionable.SIMULATE || accepted.equals(AEAmount.ZERO)) {
+            return accepted.longValueExact();
+        }
+        subtractRemaining(exactOutputRemaining, key, acceptedOutput);
+        subtractRemaining(exactRemainderRemaining, key, acceptedRemainder);
+        if (exactOutputRemaining.isEmpty() && exactRemainderRemaining.isEmpty()) {
+            ExactWorkCommand completed = Objects.requireNonNull(exactInFlight);
+            exactSession.completeIssued(completed, completed.expectedOutputs(), completed.expectedRemainders());
+            exactInFlight = null;
+            markDirty();
+        }
+        return accepted.longValueExact();
+    }
+
+    private static AEAmount minimum(AEAmount left, AEAmount right) {
+        return left.compareTo(right) <= 0 ? left : right;
+    }
+
+    private static void subtractRemaining(Map<KeyId, AEAmount> amounts, KeyId key, AEAmount consumed) {
+        if (consumed.equals(AEAmount.ZERO)) {
+            return;
+        }
+        AEAmount remaining = amounts.get(key).subtractExact(consumed);
+        if (remaining.equals(AEAmount.ZERO)) {
+            amounts.remove(key);
+        } else {
+            amounts.put(key, remaining);
+        }
     }
 
     public void markDirty() {
@@ -339,6 +503,11 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
         return requireExactSession().startWorkOrder();
     }
 
+    /** Cancels a reservation which has not been handed to a work order. */
+    public ExactCpuExecutionSession.ExactCpuSessionResult cancelExactReservation() {
+        return requireExactSession().cancelReservation();
+    }
+
     /**
      * Activates a decoded native recovery tag exclusively through the CPU-owned exact-session boundary. No legacy job,
      * storage facade, or raw saved tag is made authoritative on this path.
@@ -360,6 +529,21 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             this.exactRecovery.markActivated();
         }
         return result;
+    }
+
+    /** True when native NBT contains a decoded inert exact checkpoint awaiting this grid's activation. */
+    public boolean hasPendingExactRecovery() {
+        return this.exactSession == null
+                && this.exactRecovery.state() == ExactCpuRecoveryPersistence.State.PENDING_ACTIVATION;
+    }
+
+    /** Activates native recovery with the CPU core as its action source. */
+    public ExactCpuExecutionSession.ActivationResult activateExactRecovery(BrokerExactStorage storage,
+            CurrentPatternSnapshotSource patterns) {
+        if (machineSrc == null) {
+            return new ExactCpuExecutionSession.Rejected(ExactRecoveryActivation.Reason.INVALID_CHECKPOINT);
+        }
+        return activateExactRecovery(storage, patterns, machineSrc);
     }
 
     /** Typed exact status for packet/UI integrations; legacy views remain their explicit bounded projection. */

@@ -81,6 +81,16 @@ public final class ExactCpuExecutionSession {
         return new Broker(observe(result), snapshot());
     }
 
+    /** Cancels a prepared plan before any physical reservation exists. */
+    public ExactCpuSessionResult discardPrepared() {
+        ExactCpuLedgerSnapshot snapshot = ledger.snapshot();
+        ExactCpuLedgerResult result = snapshot.state() == ExactCpuLedgerState.PREPARED && snapshot.handle().isPresent()
+                ? ledger.cancelPrepared(snapshot.handle().orElseThrow())
+                : new ExactCpuLedgerResult.Failure(ExactCpuLedgerResult.FailureReason.WRONG_STATE);
+        publishIfDurable();
+        return new Ledger(result, snapshot());
+    }
+
     public ExactCpuSessionResult startWorkOrder() {
         CpuPlanHandle handle = ledger.snapshot().handle().orElse(null);
         ExactTransferBrokerResult result = handle == null
@@ -123,12 +133,30 @@ public final class ExactCpuExecutionSession {
         return transition(order -> order.accept(acceptance));
     }
 
+    /** Accepts the exact command returned by {@link #issueNext(long)} without exposing evidence constructors. */
+    public ExactCpuSessionResult acceptIssued(ExactWorkCommand command) {
+        return accept(new WorkCommandAcceptance(Objects.requireNonNull(command, "command")));
+    }
+
     public ExactCpuSessionResult reject(WorkCommandRejection rejection) {
         return transition(order -> order.reject(rejection));
     }
 
+    /** Rejects an unexecuted issued command and restores its custody to the work order. */
+    public ExactCpuSessionResult rejectIssued(ExactWorkCommand command) {
+        return reject(new WorkCommandRejection(Objects.requireNonNull(command, "command")));
+    }
+
     public ExactCpuSessionResult complete(WorkCommandCompletion completion) {
         return transition(order -> order.complete(completion));
+    }
+
+    /** Completes one accepted command with exact, identity-bound physical results. */
+    public ExactCpuSessionResult completeIssued(ExactWorkCommand command,
+            java.util.Map<appeng.rebuild.key.KeyId, appeng.rebuild.quantity.AEAmount> actualOutputs,
+            java.util.Map<appeng.rebuild.key.KeyId, appeng.rebuild.quantity.AEAmount> actualRemainders) {
+        return complete(new WorkCommandCompletion(Objects.requireNonNull(command, "command"), actualOutputs,
+                actualRemainders));
     }
 
     public ExactCpuSessionResult requestCancellation() {
