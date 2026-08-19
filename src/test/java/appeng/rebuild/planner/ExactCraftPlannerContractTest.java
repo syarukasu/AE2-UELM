@@ -282,7 +282,9 @@ class ExactCraftPlannerContractTest {
                 () -> new PlannedInputSelection(0, 0, AEAmount.ZERO, new KeyId(0), AEAmount.ONE, AEAmount.ONE,
                         Optional.empty()));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedPatternBatch(new PatternId("zero-batch"), AEAmount.ZERO, List.of()));
+                () -> new PlannedPatternBatch(new PlannedBatchId(0L),
+                        new PlannedBatchCause.Root(new KeyId(0), AEAmount.ONE),
+                        new PatternId("zero-batch"), AEAmount.ZERO, List.of()));
 
         CompiledPattern pattern = noInput("immutable", 1, 1L);
         ExactCraftPlanDraft draft = success(snapshot(2, Map.of()), List.of(pattern), Map.of(pattern.id(), 0),
@@ -302,9 +304,11 @@ class ExactCraftPlannerContractTest {
         AEAmount aboveLimit = craftAboveLimitAmount();
         PatternId id = new PatternId("batch-bound");
 
-        assertDoesNotThrow(() -> new PlannedPatternBatch(id, boundary, List.of()));
+        PlannedBatchCause cause = new PlannedBatchCause.Root(new KeyId(0), AEAmount.ONE);
+
+        assertDoesNotThrow(() -> new PlannedPatternBatch(new PlannedBatchId(0L), cause, id, boundary, List.of()));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedPatternBatch(id, aboveLimit, List.of()));
+                () -> new PlannedPatternBatch(new PlannedBatchId(0L), cause, id, aboveLimit, List.of()));
     }
 
     @Test
@@ -347,12 +351,16 @@ class ExactCraftPlannerContractTest {
     void twoIndividuallyBoundedBatchesCannotAggregateBeyondTheExactBound() {
         AEAmount boundary = craftBoundaryAmount();
         PatternId patternId = new PatternId("aggregate-bound");
-        PlannedPatternBatch first = new PlannedPatternBatch(patternId, boundary, List.of());
-        PlannedPatternBatch second = new PlannedPatternBatch(patternId, boundary, List.of());
+        ExactCraftRequest aggregateRequest = request(1, 1L);
+        PlannedBatchCause rootCause = new PlannedBatchCause.Root(aggregateRequest.output(), aggregateRequest.amount());
+        PlannedPatternBatch first = new PlannedPatternBatch(new PlannedBatchId(0L), rootCause, patternId, boundary,
+                List.of());
+        PlannedPatternBatch second = new PlannedPatternBatch(new PlannedBatchId(1L), rootCause, patternId, boundary,
+                List.of());
         GridRevision revision = emptyGridRevision();
         DependencySet dependencies = new DependencySet.Builder(revision).build();
 
-        assertThrows(IllegalArgumentException.class, () -> new ExactCraftPlanDraft(revision, request(1, 1L),
+        assertThrows(IllegalArgumentException.class, () -> new ExactCraftPlanDraft(revision, aggregateRequest,
                 Map.of(patternId, craftAboveLimitAmount()), Map.of(), Map.of(), List.of(first, second), dependencies));
     }
 

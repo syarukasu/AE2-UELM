@@ -196,19 +196,22 @@ class ExactCraftPlannerB2ContractTest {
         PlannedInputSelection first = selection(0, 0);
         PlannedInputSelection second = selection(0, 1);
         PatternId id = new PatternId("batch-schema");
+        PlannedBatchId batchId = new PlannedBatchId(0L);
+        PlannedBatchCause cause = new PlannedBatchCause.Root(new KeyId(0), AEAmount.ONE);
 
-        assertDoesNotThrow(() -> new PlannedPatternBatch(id, AEAmount.ONE, List.of(first, second)));
+        assertDoesNotThrow(() -> new PlannedPatternBatch(batchId, cause, id, AEAmount.ONE, List.of(first, second)));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedPatternBatch(id, AEAmount.ONE, List.of(first, first)));
+                () -> new PlannedPatternBatch(batchId, cause, id, AEAmount.ONE, List.of(first, first)));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedPatternBatch(id, AEAmount.ONE, List.of(second, first)));
+                () -> new PlannedPatternBatch(batchId, cause, id, AEAmount.ONE, List.of(second, first)));
 
         List<PlannedInputSelection> overCap = new ArrayList<>(PatternLimits.MAX_TOTAL_CANDIDATES_PER_PATTERN + 1);
         for (int candidateIndex = 0; candidateIndex < PatternLimits.MAX_CANDIDATES_PER_INPUT; candidateIndex++) {
             overCap.add(selection(0, candidateIndex));
         }
         overCap.add(selection(1, 0));
-        assertThrows(IllegalArgumentException.class, () -> new PlannedPatternBatch(id, AEAmount.ONE, overCap));
+        assertThrows(IllegalArgumentException.class,
+                () -> new PlannedPatternBatch(batchId, cause, id, AEAmount.ONE, overCap));
     }
 
     @Test

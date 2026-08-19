@@ -64,12 +64,13 @@ public final class ExactCraftPlanner {
         private final Map<KeyId, AEAmount> produced = new HashMap<>();
         private final Map<KeyId, AEAmount> storageConsumed = new HashMap<>();
         private final Map<PatternId, AEAmount> executions = new HashMap<>();
-        private final List<PlannedPatternBatch> batches = new ArrayList<>();
+        private final List<PlannedCausalStep> causalSteps = new ArrayList<>();
         private final List<Undo> undo = new ArrayList<>();
         private final Set<PatternId> activePatterns = new HashSet<>();
         private final ArrayDeque<Frame> frames = new ArrayDeque<>();
         private int decisions;
         private int mutations;
+        private long nextBatchId;
         private ExactCraftPlanResult.FailureReason rootFailure;
 
         private Search(ExactCraftRequest request, StorageSnapshot storage, NormalizedPatternSnapshot patterns,
@@ -83,7 +84,8 @@ public final class ExactCraftPlanner {
         }
 
         private ExactCraftPlanResult run() {
-            frames.push(new Frame(request.output(), request.amount(), true, checkpoint()));
+            frames.push(new Frame(request.output(), request.amount(), true, checkpoint(),
+                    new PlannedBatchCause.Root(request.output(), request.amount())));
             while (!frames.isEmpty()) {
                 if (frames.size() > PlannerLimits.MAX_CRAFT_STACK_DEPTH) {
                     throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
@@ -94,7 +96,7 @@ public final class ExactCraftPlanner {
                 return new ExactCraftPlanResult.Failure(rootFailure);
             }
             return new ExactCraftPlanResult.Success(new ExactCraftPlanDraft(gridRevision, request, executions,
-                    storageConsumed, produced, batches, dependencies.build()));
+                    storageConsumed, produced, causalSteps, dependencies.build()));
         }
 
         private void step(Frame frame) {
@@ -193,6 +195,7 @@ public final class ExactCraftPlanner {
                 frame.chunkCheckpoint = checkpoint();
                 frame.candidateStarts = new int[frame.producer.pattern.inputs().size()];
                 frame.rotationCounts = new int[frame.producer.pattern.inputs().size()];
+                frame.batchId = reserveBatchId();
             }
             frame.executions = chunk;
             frame.inputIndex = 0;
@@ -243,7 +246,9 @@ public final class ExactCraftPlanner {
             frame.pendingUnits = units;
             frame.pendingInitial = initial;
             frame.phase = Phase.WAIT_CHILD;
-            frames.push(new Frame(candidate.key(), initial, false, frame.candidateCheckpoint));
+            frames.push(new Frame(candidate.key(), initial, false, frame.candidateCheckpoint,
+                    new PlannedBatchCause.Input(frame.batchId, PlannedBatchCause.Input.NORMAL_CONSUMER_MEMBER,
+                            frame.inputIndex, frame.allocation.candidateIndex(), candidate.key(), initial)));
         }
 
         private void handleChild(Frame frame) {
@@ -278,7 +283,7 @@ public final class ExactCraftPlanner {
                 selection.remainderReturn().ifPresent(remainder -> credit(remainder.key(), remainder.amount()));
             }
             add(executions, pattern.id(), frame.executions, PatternLimits.MAX_GRAPH_NODES);
-            addBatch(pattern, frame.executions, frame.selections);
+            addBatch(frame.batchId, frame.cause, pattern, frame.executions, frame.selections);
             frame.remaining = consumeProduced(frame.key, frame.remaining);
             if (frame.remaining.equals(AEAmount.ZERO)) {
                 activePatterns.remove(pattern.id());
@@ -298,6 +303,7 @@ public final class ExactCraftPlanner {
             }
             frame.allocation = null;
             frame.selections = null;
+            frame.batchId = null;
             if (frame.chunkSchedule == null) {
                 // The full attempt has just failed. Only now is a bounded binary fallback relevant.
                 frame.chunkSchedule = binarySchedule(frame.wholeAttempt);
@@ -483,15 +489,23 @@ public final class ExactCraftPlanner {
             }
         }
 
-        private void addBatch(CompiledPattern pattern, AEAmount batchExecutions,
+        private void addBatch(PlannedBatchId id, PlannedBatchCause cause, CompiledPattern pattern,
+                AEAmount batchExecutions,
                 List<PlannedInputSelection> selections) {
-            if (batches.size() >= PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
+            if (causalSteps.size() >= PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
                 throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
             }
             validateSelections(pattern, batchExecutions, selections);
             mutation();
-            batches.add(new PlannedPatternBatch(pattern.id(), batchExecutions, selections));
-            undo.add(new ListUndo<>(batches));
+            causalSteps.add(new PlannedPatternBatch(id, cause, pattern.id(), batchExecutions, selections));
+            undo.add(new ListUndo<>(causalSteps));
+        }
+
+        private PlannedBatchId reserveBatchId() {
+            if (nextBatchId == Long.MAX_VALUE) {
+                throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
+            }
+            return new PlannedBatchId(nextBatchId++);
         }
 
         private void validateSelections(CompiledPattern pattern, AEAmount batchExecutions,
@@ -653,6 +667,10 @@ public final class ExactCraftPlanner {
                 return input.candidates().get(candidateIndex);
             }
 
+            private int candidateIndex() {
+                return candidateIndex;
+            }
+
             private AEAmount nextAttemptUnits() {
                 if (wholeAttempt) {
                     wholeAttempt = false;
@@ -751,12 +769,15 @@ public final class ExactCraftPlanner {
         private ExactCraftPlanResult.FailureReason childFailure;
         private boolean sawCycle;
         private boolean sawUnsatisfiable;
+        private final PlannedBatchCause cause;
+        private PlannedBatchId batchId;
 
-        private Frame(KeyId key, AEAmount required, boolean root, int entryCheckpoint) {
+        private Frame(KeyId key, AEAmount required, boolean root, int entryCheckpoint, PlannedBatchCause cause) {
             this.key = key;
             this.required = required;
             this.root = root;
             this.entryCheckpoint = entryCheckpoint;
+            this.cause = cause;
         }
     }
 

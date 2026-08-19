@@ -1,7 +1,10 @@
 package appeng.rebuild.planner;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -14,10 +17,11 @@ import appeng.rebuild.quantity.AEAmount;
 
 /**
  * Immutable, non-authoritative exact crafting draft. It grants no execution authority; Phase 6 validates and executes
- * its causal batches against a later CPU ledger.
+ * its causal steps against a later CPU ledger.
  *
  * <p>
- * The maps are deterministic aggregate views. {@link #batches()} preserves causal planning order rather than sorting.
+ * The maps are deterministic aggregate views. {@link #causalSteps()} is authoritative. {@link #batches()} is an
+ * immutable compatibility projection retaining causal order for normal pattern batches only.
  */
 public final class ExactCraftPlanDraft {
     private final GridRevision gridRevision;
@@ -25,25 +29,31 @@ public final class ExactCraftPlanDraft {
     private final Map<PatternId, AEAmount> patternExecutions;
     private final Map<KeyId, AEAmount> storageConsumed;
     private final Map<KeyId, AEAmount> surplus;
+    private final List<PlannedCausalStep> causalSteps;
     private final List<PlannedPatternBatch> batches;
     private final DependencySet dependencies;
 
+    /** Creates a draft from authoritative causal steps. */
     public ExactCraftPlanDraft(GridRevision gridRevision, ExactCraftRequest request,
             Map<PatternId, AEAmount> patternExecutions, Map<KeyId, AEAmount> storageConsumed,
-            Map<KeyId, AEAmount> surplus, List<PlannedPatternBatch> batches, DependencySet dependencies) {
+            Map<KeyId, AEAmount> surplus, Collection<? extends PlannedCausalStep> causalSteps,
+            DependencySet dependencies) {
         this.gridRevision = Objects.requireNonNull(gridRevision, "gridRevision");
         this.request = Objects.requireNonNull(request, "request");
         PlannerAmounts.requireWithinLimit(request.amount(), "request amount");
-        validateBounds(patternExecutions, storageConsumed, surplus, batches);
+        List<PlannedCausalStep> copiedSteps = copyCausalSteps(causalSteps);
+        validateBounds(patternExecutions, storageConsumed, surplus, copiedSteps);
         this.patternExecutions = copyAmounts(patternExecutions, Comparator.naturalOrder(), "patternExecutions");
         this.storageConsumed = copyAmounts(storageConsumed, Comparator.comparingInt(KeyId::value), "storageConsumed");
         this.surplus = copyAmounts(surplus, Comparator.comparingInt(KeyId::value), "surplus");
-        this.batches = List.copyOf(Objects.requireNonNull(batches, "batches"));
+        this.causalSteps = copiedSteps;
+        this.batches = normalBatchProjection(copiedSteps);
         this.dependencies = Objects.requireNonNull(dependencies, "dependencies");
         if (!gridRevision.equals(dependencies.gridRevision())) {
             throw new IllegalArgumentException("Draft dependencies must use the draft grid revision");
         }
-        validateBatchExecutions();
+        validateCausalReferences();
+        validatePatternExecutions();
     }
 
     public GridRevision gridRevision() {
@@ -66,6 +76,12 @@ public final class ExactCraftPlanDraft {
         return surplus;
     }
 
+    /** Authoritative immutable causal step list, in producer-before-consumer causal order. */
+    public List<PlannedCausalStep> causalSteps() {
+        return causalSteps;
+    }
+
+    /** Immutable normal-step projection retained for source compatibility. */
     public List<PlannedPatternBatch> batches() {
         return batches;
     }
@@ -74,30 +90,109 @@ public final class ExactCraftPlanDraft {
         return dependencies;
     }
 
-    private void validateBatchExecutions() {
+    private void validateCausalReferences() {
+        Map<PlannedBatchId, Integer> positions = new HashMap<>();
+        for (int index = 0; index < causalSteps.size(); index++) {
+            PlannedCausalStep step = causalSteps.get(index);
+            if (positions.put(step.id(), index) != null) {
+                throw new IllegalArgumentException("Causal step ids must be unique");
+            }
+        }
+        for (int index = 0; index < causalSteps.size(); index++) {
+            PlannedCausalStep step = causalSteps.get(index);
+            if (step.cause() instanceof PlannedBatchCause.Root root) {
+                if (!root.output().equals(request.output()) || !root.demandedAmount().equals(request.amount())) {
+                    throw new IllegalArgumentException("Root cause must match the exact craft request");
+                }
+                continue;
+            }
+            PlannedBatchCause.Input input = (PlannedBatchCause.Input) step.cause();
+            Integer consumerPosition = positions.get(input.consumerBatchId());
+            if (consumerPosition == null || consumerPosition <= index) {
+                throw new IllegalArgumentException("Input causes must reference a later existing consumer step");
+            }
+            PlannedCausalStep consumer = causalSteps.get(consumerPosition);
+            if (input.cycleMemberIndex() == PlannedBatchCause.Input.NORMAL_CONSUMER_MEMBER) {
+                if (!(consumer instanceof PlannedPatternBatch batch)
+                        || !matchesSelection(batch.inputs(), input.inputIndex(), input.candidateIndex(), input.key())) {
+                    throw new IllegalArgumentException("Normal input cause must reference its consumer selection");
+                }
+            } else {
+                if (!(consumer instanceof PlannedCycleBatch cycle)
+                        || input.cycleMemberIndex() >= cycle.members().size()
+                        || !matchesSelection(cycle.members().get(input.cycleMemberIndex()).inputsPerTurn(),
+                                input.inputIndex(), input.candidateIndex(), input.key())) {
+                    throw new IllegalArgumentException(
+                            "Cycle input cause must reference its consumer member selection");
+                }
+            }
+        }
+    }
+
+    private void validatePatternExecutions() {
         TreeMap<PatternId, AEAmount> totals = new TreeMap<>();
-        for (PlannedPatternBatch batch : batches) {
-            Objects.requireNonNull(batch, "batches cannot contain null");
-            totals.merge(batch.patternId(), batch.executions(),
-                    (left, right) -> PlannerAmounts.checkedAdd(left, right, "batch executions"));
+        for (PlannedCausalStep step : causalSteps) {
+            if (step instanceof PlannedPatternBatch batch) {
+                addExecution(totals, batch.patternId(), batch.executions());
+            } else {
+                PlannedCycleBatch cycle = (PlannedCycleBatch) step;
+                for (PlannedCycleMember member : cycle.members()) {
+                    addExecution(totals, member.patternId(), PlannerAmounts.checkedMultiply(member.executionsPerTurn(),
+                            cycle.repetitions(), "cycle member executions"));
+                }
+            }
         }
         if (!totals.equals(patternExecutions)) {
-            throw new IllegalArgumentException("Draft pattern executions must equal causal batch totals");
+            throw new IllegalArgumentException("Draft pattern executions must equal causal step totals");
         }
+    }
+
+    private static void addExecution(Map<PatternId, AEAmount> totals, PatternId patternId, AEAmount amount) {
+        totals.merge(patternId, amount, (left, right) -> PlannerAmounts.checkedAdd(left, right, "batch executions"));
+    }
+
+    private static boolean matchesSelection(List<PlannedInputSelection> selections, int inputIndex,
+            int candidateIndex, KeyId key) {
+        for (PlannedInputSelection selection : selections) {
+            if (selection.inputIndex() == inputIndex && selection.candidateIndex() == candidateIndex
+                    && selection.consumedKey().equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<PlannedCausalStep> copyCausalSteps(Collection<? extends PlannedCausalStep> source) {
+        Objects.requireNonNull(source, "causalSteps");
+        if (source.size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
+            throw new IllegalArgumentException("Draft exceeds planning bounds");
+        }
+        List<PlannedCausalStep> result = new ArrayList<>(source.size());
+        for (PlannedCausalStep step : source) {
+            result.add(Objects.requireNonNull(step, "causalSteps cannot contain null"));
+        }
+        return List.copyOf(result);
+    }
+
+    private static List<PlannedPatternBatch> normalBatchProjection(List<PlannedCausalStep> causalSteps) {
+        List<PlannedPatternBatch> result = new ArrayList<>();
+        for (PlannedCausalStep step : causalSteps) {
+            if (step instanceof PlannedPatternBatch batch) {
+                result.add(batch);
+            }
+        }
+        return List.copyOf(result);
     }
 
     private static void validateBounds(Map<PatternId, AEAmount> patternExecutions,
             Map<KeyId, AEAmount> storageConsumed, Map<KeyId, AEAmount> surplus,
-            List<PlannedPatternBatch> batches) {
+            List<PlannedCausalStep> causalSteps) {
         if (Objects.requireNonNull(patternExecutions, "patternExecutions").size() > PatternLimits.MAX_GRAPH_NODES
                 || Objects.requireNonNull(storageConsumed, "storageConsumed")
                         .size() > PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS
                 || Objects.requireNonNull(surplus, "surplus").size() > PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS
-                || Objects.requireNonNull(batches, "batches").size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
+                || causalSteps.size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
             throw new IllegalArgumentException("Draft exceeds planning bounds");
-        }
-        for (PlannedPatternBatch batch : batches) {
-            Objects.requireNonNull(batch, "batches cannot contain null");
         }
     }
 

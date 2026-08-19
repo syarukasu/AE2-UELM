@@ -14,6 +14,12 @@ public final class PlannerLimits {
     public static final int MAX_CRAFT_QUANTITY_BITS = 65_536;
     /** Maximum binary chunks examined by one transactional producer or candidate fallback schedule. */
     public static final int MAX_CRAFT_CHUNK_BITS = 4_096;
+    /** Maximum full producer passes attempted for one demand before later phases may revisit it. */
+    public static final int MAX_CRAFT_PRODUCER_PASSES = 2;
+    /** Maximum members in one compact productive-cycle step. */
+    public static final int MAX_PRODUCTIVE_CYCLE_MEMBERS = 128;
+    /** Maximum bounded productive-cycle discovery or link attempts. */
+    public static final int MAX_PRODUCTIVE_CYCLE_ATTEMPTS = 4_096;
 
     private PlannerLimits() {
     }

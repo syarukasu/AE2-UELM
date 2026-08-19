@@ -22,4 +22,10 @@ final class PlannerAmounts {
         requireWithinLimit(right, name);
         return requireWithinLimit(left.add(right), name);
     }
+
+    static AEAmount checkedMultiply(AEAmount left, AEAmount right, String name) {
+        requireWithinLimit(left, name);
+        requireWithinLimit(right, name);
+        return requireWithinLimit(left.multiply(right), name);
+    }
 }
