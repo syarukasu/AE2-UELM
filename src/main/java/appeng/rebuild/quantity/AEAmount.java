@@ -6,9 +6,9 @@ import java.util.Objects;
 /**
  * An immutable, non-negative exact resource quantity.
  *
- * <p>Values that fit in a signed {@code long} avoid allocating a {@link BigInteger}. Values above
- * that range are represented exactly by {@code BigInteger}; negative values are never valid resource
- * quantities.
+ * <p>
+ * Values that fit in a signed {@code long} avoid allocating a {@link BigInteger}. Values above that range are
+ * represented exactly by {@code BigInteger}; negative values are never valid resource quantities.
  */
 public final class AEAmount implements Comparable<AEAmount> {
     public static final AEAmount ZERO = new AEAmount(0L);

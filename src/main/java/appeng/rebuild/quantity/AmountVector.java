@@ -7,7 +7,7 @@ import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 
 /** Dense mutable storage for exact non-negative quantities keyed by a bounded integer id. */
 public final class AmountVector {
-    private final long[] small;
+    private long[] small;
     private final Int2ObjectOpenHashMap<BigInteger> large;
     private int nonZeroSize;
 
@@ -21,6 +21,32 @@ public final class AmountVector {
 
     public int size() {
         return small.length;
+    }
+
+    /**
+     * Ensures this server-thread-owned vector can address every index below {@code requiredSize}.
+     *
+     * <p>
+     * The vector only grows. Existing exact values and {@link #nonZeroSize()} are retained.
+     */
+    public void ensureCapacity(int requiredSize) {
+        if (requiredSize < 0) {
+            throw new IllegalArgumentException("requiredSize must be non-negative: " + requiredSize);
+        }
+        if (requiredSize <= small.length) {
+            return;
+        }
+
+        int newSize = Math.max(1, small.length);
+        while (newSize < requiredSize) {
+            int grown = newSize + (newSize >>> 1);
+            if (grown <= newSize || grown < 0) {
+                newSize = requiredSize;
+                break;
+            }
+            newSize = grown;
+        }
+        small = java.util.Arrays.copyOf(small, newSize);
     }
 
     public AEAmount get(int index) {
