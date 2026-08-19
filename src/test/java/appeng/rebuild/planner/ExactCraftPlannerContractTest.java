@@ -92,7 +92,7 @@ class ExactCraftPlannerContractTest {
         assertEquals(Map.of(pattern.id(), amount), draft.patternExecutions());
         assertEquals(Map.of(new KeyId(1), amount), draft.storageConsumed());
         assertEquals(Map.of(), draft.surplus());
-        assertEquals(amount, draft.batches().get(0).inputs().get(0).consumedAmount());
+        assertEquals(amount, draft.batches().get(0).inputs().get(0).grossConsumedAmount());
     }
 
     @Test
@@ -178,17 +178,23 @@ class ExactCraftPlannerContractTest {
     }
 
     @Test
-    void mixedProducerAllocationIsTypedStrategyFailureRatherThanGlobalImpossibility() {
+    void mixedProducerAllocationUsesPriorityAndConservesBothBranches() {
         CompiledPattern twoOutput = pattern("two-output", List.of(input(0, AEAmount.ONE,
                 List.of(candidate(0, 2L, Optional.empty())), SubstitutionPolicy.EXACT)),
                 List.of(output(1, 2L, true)));
         CompiledPattern oneOutput = oneInput("one-output", 1, 2, AEAmount.ONE, 1, Optional.empty());
 
-        ExactCraftPlanResult.Failure failure = failure(
+        ExactCraftPlanDraft draft = success(
                 snapshot(3, Map.of(0, AEAmount.of(2L), 2, AEAmount.ONE)),
                 List.of(twoOutput, oneOutput), Map.of(twoOutput.id(), 9, oneOutput.id(), 0), request(1, 3L));
 
-        assertEquals(ExactCraftPlanResult.FailureReason.UNSATISFIABLE_WITHIN_STRATEGY, failure.reason());
+        assertEquals(Map.of(twoOutput.id(), AEAmount.ONE, oneOutput.id(), AEAmount.ONE), draft.patternExecutions());
+        assertEquals(Map.of(new KeyId(0), AEAmount.of(2L), new KeyId(2), AEAmount.ONE), draft.storageConsumed());
+        assertEquals(Map.of(), draft.surplus());
+        assertEquals(List.of(twoOutput.id(), oneOutput.id()), draft.batches().stream()
+                .map(PlannedPatternBatch::patternId).toList());
+        assertEquals(List.of(AEAmount.ONE, AEAmount.ONE), draft.batches().stream()
+                .map(PlannedPatternBatch::executions).toList());
     }
 
     @Test
@@ -270,9 +276,11 @@ class ExactCraftPlannerContractTest {
     @Test
     void plannerInputValueBoundsRemainTypedAndDraftContainersAreImmutable() {
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedInputSelection(-1, 0, AEAmount.ONE, new KeyId(0), AEAmount.ONE));
+                () -> new PlannedInputSelection(-1, 0, AEAmount.ONE, new KeyId(0), AEAmount.ONE, AEAmount.ONE,
+                        Optional.empty()));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedInputSelection(0, 0, AEAmount.ZERO, new KeyId(0), AEAmount.ONE));
+                () -> new PlannedInputSelection(0, 0, AEAmount.ZERO, new KeyId(0), AEAmount.ONE, AEAmount.ONE,
+                        Optional.empty()));
         assertThrows(IllegalArgumentException.class,
                 () -> new PlannedPatternBatch(new PatternId("zero-batch"), AEAmount.ZERO, List.of()));
 
@@ -305,11 +313,14 @@ class ExactCraftPlannerContractTest {
         AEAmount aboveLimit = craftAboveLimitAmount();
         KeyId key = new KeyId(0);
 
-        assertDoesNotThrow(() -> new PlannedInputSelection(0, 0, boundary, key, boundary));
+        assertDoesNotThrow(() -> new PlannedInputSelection(0, 0, boundary, key, boundary, boundary,
+                Optional.empty()));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedInputSelection(0, 0, aboveLimit, key, AEAmount.ONE));
+                () -> new PlannedInputSelection(0, 0, aboveLimit, key, AEAmount.ONE, AEAmount.ONE,
+                        Optional.empty()));
         assertThrows(IllegalArgumentException.class,
-                () -> new PlannedInputSelection(0, 0, AEAmount.ONE, key, aboveLimit));
+                () -> new PlannedInputSelection(0, 0, AEAmount.ONE, key, aboveLimit, AEAmount.ONE,
+                        Optional.empty()));
     }
 
     @Test

@@ -12,6 +12,8 @@ public final class PlannerLimits {
     public static final int MAX_CRAFT_MUTATIONS = 1_048_576;
     /** Maximum bit length of any exact quantity handled by the bounded planner. */
     public static final int MAX_CRAFT_QUANTITY_BITS = 65_536;
+    /** Maximum binary chunks examined by one transactional producer or candidate fallback schedule. */
+    public static final int MAX_CRAFT_CHUNK_BITS = 4_096;
 
     private PlannerLimits() {
     }

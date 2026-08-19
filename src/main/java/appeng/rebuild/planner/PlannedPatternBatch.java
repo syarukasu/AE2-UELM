@@ -16,14 +16,20 @@ public record PlannedPatternBatch(PatternId patternId, AEAmount executions, List
             throw new IllegalArgumentException("Planned pattern executions must be positive");
         }
         inputs = List.copyOf(Objects.requireNonNull(inputs, "inputs"));
-        if (inputs.size() > PatternLimits.MAX_INPUT_GROUPS) {
+        if (inputs.size() > PatternLimits.MAX_TOTAL_CANDIDATES_PER_PATTERN) {
             throw new IllegalArgumentException("Planned batch has too many inputs");
         }
+        int previousInput = -1;
+        int previousCandidate = -1;
         for (int index = 0; index < inputs.size(); index++) {
             PlannedInputSelection input = Objects.requireNonNull(inputs.get(index), "inputs cannot contain null");
-            if (input.inputIndex() != index) {
-                throw new IllegalArgumentException("Planned inputs must be ordered by source input index");
+            if (input.inputIndex() < previousInput || input.inputIndex() == previousInput
+                    && input.candidateIndex() <= previousCandidate) {
+                throw new IllegalArgumentException(
+                        "Planned inputs must be strictly ordered by input and candidate index");
             }
+            previousInput = input.inputIndex();
+            previousCandidate = input.candidateIndex();
         }
     }
 }
