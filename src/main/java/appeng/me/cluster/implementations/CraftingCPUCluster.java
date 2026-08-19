@@ -28,6 +28,7 @@ import org.jetbrains.annotations.Nullable;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 
 import appeng.api.config.Actionable;
@@ -51,6 +52,9 @@ import appeng.crafting.execution.CraftingCpuLogic;
 import appeng.me.cluster.IAECluster;
 import appeng.me.cluster.MBCalculator;
 import appeng.me.helpers.MachineSource;
+import appeng.me.service.StorageService;
+import appeng.rebuild.execution.ExactRecoveryCheckpoint;
+import appeng.rebuild.key.KeyRegistry;
 import appeng.util.ConfigManager;
 
 public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
@@ -72,6 +76,7 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
      * crafting job info
      */
     public final CraftingCpuLogic craftingLogic = new CraftingCpuLogic(this);
+    private final ExactCpuRecoveryPersistence exactRecovery = new ExactCpuRecoveryPersistence(this::markDirty);
 
     public CraftingCPUCluster(BlockPos boundsMin, BlockPos boundsMax) {
         this.boundsMin = boundsMin.immutable();
@@ -261,6 +266,7 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     public void writeToNBT(CompoundTag data) {
         this.craftingLogic.writeToNBT(data);
         this.configManager.writeToNBT(data);
+        this.exactRecovery.writeToNbt(data);
     }
 
     void done() {
@@ -273,12 +279,42 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             core.setPreviousState(null);
         }
 
+        // A load can precede grid formation. Decode only after the grid exposes the concrete, server-owned registry.
+        this.exactRecovery.decodeIfPossible(this.exactKeyRegistry());
+
         this.updateName();
     }
 
     public void readFromNBT(CompoundTag data) {
         this.craftingLogic.readFromNBT(data);
         this.configManager.readFromNBT(data);
+        this.exactRecovery.readFromNbt(data, this.exactKeyRegistry());
+    }
+
+    /** Publishes a validated exact checkpoint and dirties the native core only after its canonical NBT is available. */
+    void replaceExactRecovery(ExactRecoveryCheckpoint checkpoint) {
+        KeyRegistry registry = this.exactKeyRegistry();
+        if (registry == null) {
+            throw new IllegalStateException("Exact recovery publication requires the current server-thread grid registry");
+        }
+        this.exactRecovery.replace(checkpoint, registry);
+    }
+
+    ExactCpuRecoveryPersistence.State exactRecoveryState() {
+        return this.exactRecovery.state();
+    }
+
+    private @Nullable KeyRegistry exactKeyRegistry() {
+        CraftingBlockEntity core = this.getCore();
+        if (core == null || !(core.getLevel() instanceof ServerLevel serverLevel)
+                || !serverLevel.getServer().isSameThread()) {
+            return null;
+        }
+        IGrid grid = this.getGrid();
+        if (grid == null || !(grid.getStorageService() instanceof StorageService storage)) {
+            return null;
+        }
+        return storage.getExactStorage().keyRegistry();
     }
 
     public void updateName() {
