@@ -24,6 +24,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
@@ -48,8 +49,13 @@ import appeng.api.storage.MEStorage;
 import appeng.me.helpers.InterestManager;
 import appeng.me.helpers.StackWatcher;
 import appeng.me.storage.NetworkStorage;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.api.legacy.LegacyStorageFacade;
+import appeng.rebuild.key.KeyRegistry;
+import appeng.rebuild.storage.StorageServiceRebuild;
 
 public class StorageService implements IStorageService, IGridServiceProvider {
+    private static final AtomicLong NEXT_REGISTRY_GENERATION = new AtomicLong();
 
     /**
      * Tracks the storage service's state for each grid node that provides storage to the network.
@@ -63,6 +69,8 @@ public class StorageService implements IStorageService, IGridServiceProvider {
     private final InterestManager<StackWatcher<IStorageWatcherNode>> interestManager = new InterestManager<>(
             this.interests);
     private final NetworkStorage storage;
+    private final StorageServiceRebuild exactStorage;
+    private final LegacyStorageFacade inventory;
     /**
      * Publicly exposed cached available stacks.
      */
@@ -72,7 +80,6 @@ public class StorageService implements IStorageService, IGridServiceProvider {
      * {@link #cachedAvailableStacks} is modified by mistake.
      */
     private final Object2LongMap<AEKey> cachedAvailableAmounts = new Object2LongOpenHashMap<>();
-    private boolean cachedStacksNeedUpdate = true;
     /**
      * Tracks the stack watcher associated with a given grid node. Needed to clean up watchers when the node leaves the
      * grid.
@@ -80,25 +87,29 @@ public class StorageService implements IStorageService, IGridServiceProvider {
     private final Map<IGridNode, StackWatcher<IStorageWatcherNode>> watchers = new IdentityHashMap<>();
 
     public StorageService() {
-        this.storage = new NetworkStorage();
+        KeyRegistry keyRegistry = new KeyRegistry(nextRegistryGeneration());
+        this.exactStorage = new StorageServiceRebuild(keyRegistry);
+        this.storage = new NetworkStorage(exactStorage);
+        this.inventory = new LegacyStorageFacade(storage, exactStorage);
     }
 
     @Override
     public void onServerEndTick() {
-        if (interestManager.isEmpty()) {
-            // lazily rebuild cache list
-            cachedStacksNeedUpdate = true;
-        } else {
-            // we need to rebuild the cache every tick to notify listeners
-            updateCachedStacks();
+        if (exactStorage.reconcileEndTick()) {
+            updateCachedStacksFromExact();
         }
     }
 
-    private void updateCachedStacks() {
-        cachedStacksNeedUpdate = false;
+    private void updateCachedStacksFromExact() {
+        KeyCounter projectedStacks = new KeyCounter();
+        exactStorage.ledger().enumerate((key, amount) -> projectedStacks.add(exactStorage.keyRegistry().resolve(key),
+                LegacyAmountProjection.saturatingLong(amount)));
+        replaceCachedStacks(projectedStacks);
+    }
 
+    private void replaceCachedStacks(KeyCounter projectedStacks) {
         cachedAvailableStacks.clear();
-        storage.getAvailableStacks(cachedAvailableStacks);
+        cachedAvailableStacks.addAll(projectedStacks);
         // clear() only clears the inner maps,
         // so ensure that the outer map gets cleaned up too
         cachedAvailableStacks.removeEmptySubmaps();
@@ -146,6 +157,7 @@ public class StorageService implements IStorageService, IGridServiceProvider {
             ProviderState state = new ProviderState(storageProvider);
             this.nodeProviders.put(node, state);
             state.mount();
+            bootstrapReconcileAndProject();
         }
 
         var watcher = node.getService(IStorageWatcherNode.class);
@@ -170,20 +182,23 @@ public class StorageService implements IStorageService, IGridServiceProvider {
         var providerState = this.nodeProviders.remove(node);
         if (providerState != null) {
             providerState.unmount();
+            bootstrapReconcileAndProject();
         }
     }
 
     @Override
     public MEStorage getInventory() {
-        return storage;
+        return inventory;
     }
 
     @Override
     public KeyCounter getCachedInventory() {
-        if (cachedStacksNeedUpdate) {
-            updateCachedStacks();
-        }
         return cachedAvailableStacks;
+    }
+
+    /** Returns the exact storage reconstruction, which rejects access while invalid or dirty. */
+    public StorageServiceRebuild getExactStorage() {
+        return exactStorage;
     }
 
     @Override
@@ -191,17 +206,23 @@ public class StorageService implements IStorageService, IGridServiceProvider {
         var state = new ProviderState(provider);
         this.globalProviders.add(state);
         state.mount();
+        bootstrapReconcileAndProject();
     }
 
     @Override
     public void removeGlobalStorageProvider(IStorageProvider provider) {
         var it = this.globalProviders.iterator();
+        boolean removed = false;
         while (it.hasNext()) {
             var state = it.next();
             if (state.provider == provider) {
                 it.remove();
                 state.unmount();
+                removed = true;
             }
+        }
+        if (removed) {
+            bootstrapReconcileAndProject();
         }
     }
 
@@ -212,6 +233,7 @@ public class StorageService implements IStorageService, IGridServiceProvider {
             throw new IllegalArgumentException("The given node is not part of this grid or has no storage provider.");
         }
         state.update();
+        bootstrapReconcileAndProject();
     }
 
     @Override
@@ -219,6 +241,7 @@ public class StorageService implements IStorageService, IGridServiceProvider {
         for (var state : globalProviders) {
             if (state.provider == provider) {
                 state.update();
+                bootstrapReconcileAndProject();
                 return;
             }
         }
@@ -228,7 +251,23 @@ public class StorageService implements IStorageService, IGridServiceProvider {
 
     @Override
     public void invalidateCache() {
-        cachedStacksNeedUpdate = true;
+        exactStorage.markDirty();
+    }
+
+    private void bootstrapReconcileAndProject() {
+        if (exactStorage.reconcileEndTick()) {
+            updateCachedStacksFromExact();
+        }
+    }
+
+    private static long nextRegistryGeneration() {
+        while (true) {
+            long current = NEXT_REGISTRY_GENERATION.get();
+            long following = Math.incrementExact(current);
+            if (NEXT_REGISTRY_GENERATION.compareAndSet(current, following)) {
+                return current;
+            }
+        }
     }
 
     /**
