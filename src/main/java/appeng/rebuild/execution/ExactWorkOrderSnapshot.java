@@ -24,6 +24,7 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
         int causalStepIndex, AEAmount remainingExecutions, List<AEAmount> selectionRemaining,
         AEAmount cycleRemainingRepetitions, int cycleMemberIndex, AEAmount cycleMemberRemainingExecutions,
         List<AEAmount> cycleSelectionRemaining,
+        Optional<ExactWorkOrderReleaseMode> releaseMode,
         long nextGeneration, boolean generationExhausted,
         Optional<ExactWorkCommand> outstandingCommand, Optional<ExactWorkCommand> inFlightCommand,
         Optional<ExactWorkDiscrepancy> discrepancy, Optional<ExactCompletedCommandEvidence> completedEvidence,
@@ -73,6 +74,7 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
                 throw new IllegalArgumentException("Cycle selection cursor exceeds the bounded exact quantity limit");
             }
         }
+        releaseMode = Objects.requireNonNull(releaseMode, "releaseMode");
         if (cycleMemberIndex < 0 && (!cycleRemainingRepetitions.equals(AEAmount.ZERO)
                 || !cycleMemberRemainingExecutions.equals(AEAmount.ZERO) || !cycleSelectionRemaining.isEmpty())) {
             throw new IllegalArgumentException("No cycle member may retain cycle progress");
@@ -138,12 +140,20 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
                 require(outstandingCommand.isEmpty() && inFlightCommand.isPresent() && discrepancy.isEmpty()
                         && completedEvidence.isEmpty() && !completedEvidenceProgressApplied,
                         "In-flight state requires exactly its in-flight command");
-            case READY, SETTLEMENT_PENDING, RELEASE_PENDING, COMPLETED -> require(
+            case READY, SETTLEMENT_PENDING -> require(
                     outstandingCommand.isEmpty() && inFlightCommand.isEmpty() && discrepancy.isEmpty()
-                            && completedEvidence.isEmpty() && !completedEvidenceProgressApplied,
+                            && completedEvidence.isEmpty() && !completedEvidenceProgressApplied
+                            && releaseMode.isEmpty(),
                     "Non-active work state cannot retain command or discrepancy evidence");
+            case RELEASE_PENDING -> require(outstandingCommand.isEmpty() && inFlightCommand.isEmpty()
+                    && discrepancy.isEmpty() && completedEvidence.isEmpty() && !completedEvidenceProgressApplied
+                    && releaseMode.isPresent(), "Release pending requires one durable release mode");
+            case COMPLETED -> require(outstandingCommand.isEmpty() && inFlightCommand.isEmpty()
+                    && discrepancy.isEmpty() && completedEvidence.isEmpty() && !completedEvidenceProgressApplied
+                    && releaseMode.isPresent(),
+                    "Completed work requires its durable settlement or cancellation outcome");
             case CANCEL_PENDING -> require(outstandingCommand.isEmpty() && discrepancy.isEmpty()
-                    && completedEvidence.isEmpty() && !completedEvidenceProgressApplied,
+                    && completedEvidence.isEmpty() && !completedEvidenceProgressApplied && releaseMode.isEmpty(),
                     "Cancellation cannot retain an outstanding command or discrepancy evidence");
             case FAIL_CLOSED -> {
                 // A closed order may retain either command custody linkage or immutable discrepancy evidence.

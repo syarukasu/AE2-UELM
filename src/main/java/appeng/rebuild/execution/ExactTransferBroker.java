@@ -183,7 +183,7 @@ public final class ExactTransferBroker {
      * <p>
      * This is intentionally package-private: only the server-thread execution boundary may turn a CPU reservation into
      * runnable work. Once the ledger handoff succeeds, this broker has no release or cancellation path for the moved
-     * materials.
+     * materials; it retains only an identity-bound terminal completion permit so the next CPU lifecycle can begin.
      */
     synchronized ExactTransferBrokerResult startWorkOrder(ExactCpuLedger requestedLedger,
             CpuPlanHandle requestedHandle) {
@@ -220,7 +220,7 @@ public final class ExactTransferBroker {
             // Complete every allocation and validation which can throw before the irreversible CPU ownership handoff.
             WorkOrderId stagedWorkOrderId = WorkOrderId.fresh();
             WorkOrderStaging staging = new WorkOrderStaging(stagedWorkOrderId, planId, handle, reservationId, custody,
-                    storage, serverThread, actionSource, requestedLedger);
+                    storage, serverThread, actionSource, requestedLedger, this);
 
             ExactCpuLedgerResult handoff = requestedLedger.handoff(handle);
             if (!(handoff instanceof ExactCpuLedgerResult.HandedOff handedOff)) {
@@ -404,6 +404,14 @@ public final class ExactTransferBroker {
         return null;
     }
 
+    private boolean onServerThread() {
+        try {
+            return serverThread.isServerThread();
+        } catch (RuntimeException failure) {
+            return false;
+        }
+    }
+
     private void endOperation() {
         entered = false;
     }
@@ -428,6 +436,47 @@ public final class ExactTransferBroker {
         state = ExactTransferBrokerState.IDLE;
     }
 
+    /**
+     * Server-serialized observation permit for the final work-order acknowledgement. It grants no custody operation; it
+     * only proves this broker still owns the exact leased observation which the work order is about to complete.
+     */
+    synchronized WorkOrderCompletionPermit permitWorkOrderCompletion(WorkOrderId expectedWorkOrderId,
+            UUID expectedLeaseIdentity, ExactPlanId expectedPlanId, CpuPlanHandle expectedHandle,
+            ReservationId expectedReservationId) {
+        if (entered) {
+            return null;
+        }
+        entered = true;
+        try {
+            if (!onServerThread() || state != ExactTransferBrokerState.LEASED || !escrowed.isEmpty()
+                    || !Objects.equals(workOrderId, expectedWorkOrderId)
+                    || !Objects.equals(leaseIdentity, expectedLeaseIdentity)
+                    || !Objects.equals(planId, expectedPlanId) || !Objects.equals(handle, expectedHandle)
+                    || !Objects.equals(reservationId, expectedReservationId)) {
+                return null;
+            }
+            return new WorkOrderCompletionPermit(this, expectedWorkOrderId, expectedLeaseIdentity, expectedPlanId,
+                    expectedHandle, expectedReservationId);
+        } finally {
+            entered = false;
+        }
+    }
+
+    /**
+     * Assignment-only terminal transition: no callback or storage access may occur after its permit was validated.
+     */
+    synchronized boolean completeLeasedWorkOrder(WorkOrderCompletionPermit permit) {
+        if (permit == null || permit.owner != this || state != ExactTransferBrokerState.LEASED || !escrowed.isEmpty()
+                || !Objects.equals(workOrderId, permit.workOrderId)
+                || !Objects.equals(leaseIdentity, permit.leaseIdentity)
+                || !Objects.equals(planId, permit.planId) || !Objects.equals(handle, permit.handle)
+                || !Objects.equals(reservationId, permit.reservationId)) {
+            return false;
+        }
+        clearToIdle();
+        return true;
+    }
+
     /** Records an already-successful CPU handoff without granting this broker another custody mutation path. */
     private void retainHandoffFailure(WorkOrderId stagedWorkOrderId, ReservedPlanLease lease) {
         workOrderId = stagedWorkOrderId;
@@ -447,10 +496,30 @@ public final class ExactTransferBroker {
                 && moved.compareTo(requested) <= 0;
     }
 
+    static final class WorkOrderCompletionPermit {
+        private final ExactTransferBroker owner;
+        private final WorkOrderId workOrderId;
+        private final UUID leaseIdentity;
+        private final ExactPlanId planId;
+        private final CpuPlanHandle handle;
+        private final ReservationId reservationId;
+
+        private WorkOrderCompletionPermit(ExactTransferBroker owner, WorkOrderId workOrderId, UUID leaseIdentity,
+                ExactPlanId planId, CpuPlanHandle handle, ReservationId reservationId) {
+            this.owner = owner;
+            this.workOrderId = workOrderId;
+            this.leaseIdentity = leaseIdentity;
+            this.planId = planId;
+            this.handle = handle;
+            this.reservationId = reservationId;
+        }
+    }
+
     /** Immutable pre-handoff data which makes post-handoff work-order materialization assignment-only. */
     private record WorkOrderStaging(WorkOrderId workOrderId, ExactPlanId planId, CpuPlanHandle handle,
             ReservationId reservationId, Map<KeyId, AEAmount> custody, BrokerExactStorage storage,
-            ServerThreadGate serverThread, IActionSource actionSource, ExactCpuLedger ledger) {
+            ServerThreadGate serverThread, IActionSource actionSource, ExactCpuLedger ledger,
+            ExactTransferBroker ownerBroker) {
         private WorkOrderStaging {
             Objects.requireNonNull(workOrderId, "workOrderId");
             Objects.requireNonNull(planId, "planId");
@@ -461,6 +530,7 @@ public final class ExactTransferBroker {
             Objects.requireNonNull(serverThread, "serverThread");
             Objects.requireNonNull(actionSource, "actionSource");
             Objects.requireNonNull(ledger, "ledger");
+            Objects.requireNonNull(ownerBroker, "ownerBroker");
         }
 
         private boolean matches(ReservedPlanLease lease) {
@@ -469,7 +539,8 @@ public final class ExactTransferBroker {
         }
 
         private ExactWorkOrder materialize(ReservedPlanLease lease) {
-            return ExactWorkOrder.fromStaged(workOrderId, lease, custody, storage, serverThread, actionSource, ledger);
+            return ExactWorkOrder.fromStaged(workOrderId, lease, custody, storage, serverThread, actionSource, ledger,
+                    ownerBroker);
         }
     }
 }

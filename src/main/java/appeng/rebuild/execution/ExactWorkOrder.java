@@ -42,6 +42,7 @@ public final class ExactWorkOrder {
     private final ServerThreadGate serverThread;
     private final IActionSource actionSource;
     private final ExactCpuLedger ledger;
+    private final ExactTransferBroker ownerBroker;
     private final List<ExecutionManifest> manifests;
 
     /** Only non-zero exact quantities are retained. It is never exposed without a defensive immutable copy. */
@@ -60,19 +61,21 @@ public final class ExactWorkOrder {
     private ExactWorkDiscrepancy discrepancy;
     private ExactCompletedCommandEvidence completedEvidence;
     private boolean completedEvidenceProgressApplied;
+    private ExactWorkOrderReleaseMode releaseMode;
     private long nextGeneration;
     private boolean generationExhausted;
     private boolean entered;
 
     private ExactWorkOrder(WorkOrderId workOrderId, ReservedPlanLease lease, Map<KeyId, AEAmount> initialCustody,
             BrokerExactStorage storage, ServerThreadGate serverThread, IActionSource actionSource,
-            ExactCpuLedger ledger) {
+            ExactCpuLedger ledger, ExactTransferBroker ownerBroker) {
         this.workOrderId = Objects.requireNonNull(workOrderId, "workOrderId");
         this.lease = Objects.requireNonNull(lease, "lease");
         this.storage = Objects.requireNonNull(storage, "storage");
         this.serverThread = Objects.requireNonNull(serverThread, "serverThread");
         this.actionSource = Objects.requireNonNull(actionSource, "actionSource");
         this.ledger = Objects.requireNonNull(ledger, "ledger");
+        this.ownerBroker = Objects.requireNonNull(ownerBroker, "ownerBroker");
         this.manifests = List.copyOf(lease.plan().executionManifests());
         this.custody.putAll(ExactReservationReceipt.copyDebitsOrEmpty(initialCustody, "initialCustody"));
         if (!this.custody.equals(lease.reservedDebits())) {
@@ -84,8 +87,9 @@ public final class ExactWorkOrder {
     /** Assignment-only materialization from the broker's fully validated pre-handoff staging record. */
     static ExactWorkOrder fromStaged(WorkOrderId workOrderId, ReservedPlanLease lease, Map<KeyId, AEAmount> custody,
             BrokerExactStorage storage, ServerThreadGate serverThread, IActionSource actionSource,
-            ExactCpuLedger ledger) {
-        return new ExactWorkOrder(workOrderId, lease, custody, storage, serverThread, actionSource, ledger);
+            ExactCpuLedger ledger, ExactTransferBroker ownerBroker) {
+        return new ExactWorkOrder(workOrderId, lease, custody, storage, serverThread, actionSource, ledger,
+                ownerBroker);
     }
 
     /**
@@ -231,7 +235,7 @@ public final class ExactWorkOrder {
             return admission;
         }
         try {
-            if (state != ExactWorkOrderState.IN_FLIGHT) {
+            if (state != ExactWorkOrderState.IN_FLIGHT && state != ExactWorkOrderState.CANCEL_PENDING) {
                 return transitionFailure(ExactWorkOrderTransitionResult.Reason.WRONG_STATE);
             }
             if (completion == null || inFlight == null || !inFlight.command().equals(completion.command())) {
@@ -265,6 +269,17 @@ public final class ExactWorkOrder {
             }
             try {
                 ExactCompletedCommandEvidence evidence = exactCompletedEvidence(completed, completion);
+                if (state == ExactWorkOrderState.CANCEL_PENDING) {
+                    ExactWorkOrderSnapshot proposed = snapshotForRelease(ExactWorkOrderReleaseMode.CANCELLATION,
+                            credited);
+                    ExactWorkOrderTransitionResult.Completed result = new ExactWorkOrderTransitionResult.Completed(
+                            proposed);
+                    custody = credited;
+                    inFlight = null;
+                    releaseMode = ExactWorkOrderReleaseMode.CANCELLATION;
+                    state = ExactWorkOrderState.RELEASE_PENDING;
+                    return result;
+                }
                 WorkProgress staged = completed.command().location().isCycle()
                         ? stageCycleProgress(completed, credited)
                         : stageNormalProgress(completed);
@@ -303,6 +318,7 @@ public final class ExactWorkOrder {
         return new ExactWorkOrderSnapshot(state, lease.planId(), lease.handle(), lease.reservationId(),
                 lease.leaseIdentity(), workOrderId, custody, causalStepIndex, remainingExecutions, selectionRemaining,
                 cycleRemainingRepetitions, cycleMemberIndex, cycleMemberRemainingExecutions, cycleSelectionRemaining,
+                Optional.ofNullable(releaseMode),
                 nextGeneration, generationExhausted,
                 Optional.ofNullable(outstanding).map(IssuedCommand::command), Optional.ofNullable(inFlight)
                         .map(IssuedCommand::command),
@@ -316,8 +332,171 @@ public final class ExactWorkOrder {
                 lease.leaseIdentity(), workOrderId, proposedCustody, progress.causalStepIndex(),
                 progress.remainingExecutions(), progress.selectionRemaining(), progress.cycleRemainingRepetitions(),
                 progress.cycleMemberIndex(), progress.cycleMemberRemainingExecutions(),
-                progress.cycleSelectionRemaining(), nextGeneration, generationExhausted, Optional.empty(),
+                progress.cycleSelectionRemaining(), Optional.empty(), nextGeneration, generationExhausted,
+                Optional.empty(),
                 Optional.empty(), Optional.empty(), Optional.empty(), false);
+    }
+
+    private ExactWorkOrderSnapshot snapshotForRelease(ExactWorkOrderReleaseMode proposedMode,
+            Map<KeyId, AEAmount> proposedCustody) {
+        return new ExactWorkOrderSnapshot(ExactWorkOrderState.RELEASE_PENDING, lease.planId(), lease.handle(),
+                lease.reservationId(), lease.leaseIdentity(), workOrderId, proposedCustody, causalStepIndex,
+                remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
+                cycleMemberRemainingExecutions, cycleSelectionRemaining, Optional.of(proposedMode), nextGeneration,
+                generationExhausted, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false);
+    }
+
+    private ExactWorkOrderSnapshot snapshotForCancellationWait() {
+        return new ExactWorkOrderSnapshot(ExactWorkOrderState.CANCEL_PENDING, lease.planId(), lease.handle(),
+                lease.reservationId(), lease.leaseIdentity(), workOrderId, custody, causalStepIndex,
+                remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
+                cycleMemberRemainingExecutions, cycleSelectionRemaining, Optional.empty(), nextGeneration,
+                generationExhausted, Optional.empty(), Optional.of(inFlight.command()), Optional.empty(),
+                Optional.empty(), false);
+    }
+
+    private ExactWorkOrderSnapshot snapshotForCompleted(ExactWorkOrderReleaseMode outcome) {
+        return new ExactWorkOrderSnapshot(ExactWorkOrderState.COMPLETED, lease.planId(), lease.handle(),
+                lease.reservationId(), lease.leaseIdentity(), workOrderId, Map.of(), causalStepIndex,
+                remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
+                cycleMemberRemainingExecutions, cycleSelectionRemaining, Optional.of(outcome), nextGeneration,
+                generationExhausted, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false);
+    }
+
+    /** Requests a durable cancellation. An already accepted physical command remains its sole completion authority. */
+    synchronized ExactWorkOrderLifecycleResult requestCancellation() {
+        ExactWorkOrderLifecycleResult.Failure admission = beginLifecycle();
+        if (admission != null) {
+            return admission;
+        }
+        try {
+            if (state == ExactWorkOrderState.READY || state == ExactWorkOrderState.COMMAND_OUTSTANDING) {
+                ExactWorkOrderSnapshot proposed = snapshotForRelease(ExactWorkOrderReleaseMode.CANCELLATION, custody);
+                outstanding = null;
+                releaseMode = ExactWorkOrderReleaseMode.CANCELLATION;
+                state = ExactWorkOrderState.RELEASE_PENDING;
+                return new ExactWorkOrderLifecycleResult.ReleasePending(proposed);
+            }
+            if (state == ExactWorkOrderState.IN_FLIGHT) {
+                ExactWorkOrderSnapshot proposed = snapshotForCancellationWait();
+                state = ExactWorkOrderState.CANCEL_PENDING;
+                return new ExactWorkOrderLifecycleResult.CancellationWaiting(proposed);
+            }
+            if (state == ExactWorkOrderState.CANCEL_PENDING) {
+                return new ExactWorkOrderLifecycleResult.CancellationWaiting(snapshot());
+            }
+            return lifecycleFailure(ExactWorkOrderLifecycleResult.Reason.WRONG_STATE);
+        } catch (RuntimeException failure) {
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.INVARIANT_VIOLATION);
+        } finally {
+            endOperation();
+        }
+    }
+
+    /** Releases at most one sorted distinct-key storage operation per unit of bounded budget. */
+    synchronized ExactWorkOrderLifecycleResult progressRelease(int operationBudget) {
+        ExactWorkOrderLifecycleResult.Failure admission = beginLifecycle();
+        if (admission != null) {
+            return admission;
+        }
+        try {
+            if (operationBudget <= 0 || operationBudget > PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS) {
+                return lifecycleFailure(ExactWorkOrderLifecycleResult.Reason.INVALID_OPERATION_BUDGET);
+            }
+            if (state == ExactWorkOrderState.SETTLEMENT_PENDING) {
+                snapshotForRelease(ExactWorkOrderReleaseMode.SETTLEMENT, custody);
+                releaseMode = ExactWorkOrderReleaseMode.SETTLEMENT;
+                state = ExactWorkOrderState.RELEASE_PENDING;
+            }
+            if (state != ExactWorkOrderState.RELEASE_PENDING || releaseMode == null) {
+                return lifecycleFailure(ExactWorkOrderLifecycleResult.Reason.WRONG_STATE);
+            }
+            int attempted = 0;
+            for (Map.Entry<KeyId, AEAmount> entry : new ArrayList<>(custody.entrySet())) {
+                if (attempted++ >= operationBudget) {
+                    break;
+                }
+                AEAmount inserted;
+                try {
+                    inserted = storage.insert(entry.getKey(), entry.getValue(), appeng.api.config.Actionable.MODULATE,
+                            actionSource);
+                } catch (RuntimeException transientFailure) {
+                    continue;
+                }
+                if (!validMovedAmount(inserted, entry.getValue())) {
+                    return failLifecycle(ExactWorkOrderLifecycleResult.Reason.STORAGE_PROTOCOL_VIOLATION);
+                }
+                if (!inserted.equals(AEAmount.ZERO)) {
+                    TreeMap<KeyId, AEAmount> proposedCustody = new TreeMap<>(KEY_ORDER);
+                    proposedCustody.putAll(custody);
+                    AEAmount remainder = entry.getValue().subtractExact(inserted);
+                    if (remainder.equals(AEAmount.ZERO)) {
+                        proposedCustody.remove(entry.getKey());
+                    } else {
+                        proposedCustody.put(entry.getKey(), remainder);
+                    }
+                    snapshotForRelease(releaseMode, proposedCustody);
+                    custody = proposedCustody;
+                }
+            }
+            if (!custody.isEmpty()) {
+                return new ExactWorkOrderLifecycleResult.ReleasePending(snapshot());
+            }
+            return acknowledgeHandoffInternal(lease.handle(), lease.leaseIdentity());
+        } catch (RuntimeException failure) {
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.INVARIANT_VIOLATION);
+        } finally {
+            endOperation();
+        }
+    }
+
+    /** Finalizes a fully released work order exactly once against its original CPU handoff identities. */
+    synchronized ExactWorkOrderLifecycleResult acknowledgeHandoff(CpuPlanHandle expectedHandle,
+            java.util.UUID expectedLeaseIdentity) {
+        ExactWorkOrderLifecycleResult.Failure admission = beginLifecycle();
+        if (admission != null) {
+            return admission;
+        }
+        try {
+            return acknowledgeHandoffInternal(expectedHandle, expectedLeaseIdentity);
+        } catch (RuntimeException failure) {
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.INVARIANT_VIOLATION);
+        } finally {
+            endOperation();
+        }
+    }
+
+    private ExactWorkOrderLifecycleResult acknowledgeHandoffInternal(CpuPlanHandle expectedHandle,
+            java.util.UUID expectedLeaseIdentity) {
+        if (state != ExactWorkOrderState.RELEASE_PENDING || releaseMode == null || !custody.isEmpty()) {
+            return lifecycleFailure(ExactWorkOrderLifecycleResult.Reason.WRONG_STATE);
+        }
+        if (expectedHandle == null || expectedLeaseIdentity == null || !lease.handle().equals(expectedHandle)
+                || !lease.leaseIdentity().equals(expectedLeaseIdentity)) {
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.IDENTITY_MISMATCH);
+        }
+        ExactTransferBroker.WorkOrderCompletionPermit brokerPermit = ownerBroker.permitWorkOrderCompletion(workOrderId,
+                lease.leaseIdentity(), lease.planId(), lease.handle(), lease.reservationId());
+        if (brokerPermit == null) {
+            // No CPU acknowledgement has happened, so this is a recoverable fail-closed identity disagreement.
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.IDENTITY_MISMATCH);
+        }
+        // Prevalidate the post-ack persisted observation before the irreversible ledger call.
+        ExactWorkOrderReleaseMode completedMode = releaseMode;
+        ExactWorkOrderSnapshot completed = snapshotForCompleted(completedMode);
+        ExactWorkOrderLifecycleResult result = completedMode == ExactWorkOrderReleaseMode.SETTLEMENT
+                ? new ExactWorkOrderLifecycleResult.Settled(completed)
+                : new ExactWorkOrderLifecycleResult.Cancelled(completed);
+        ExactCpuLedgerResult acknowledged = ledger.acknowledgeHandoff(expectedHandle, expectedLeaseIdentity);
+        if (!(acknowledged instanceof ExactCpuLedgerResult.HandoffAcknowledged)) {
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.CPU_REJECTED);
+        }
+        if (!ownerBroker.completeLeasedWorkOrder(brokerPermit)) {
+            // This cannot happen under the shared server-thread permit. Preserve the terminal identities fail-closed.
+            return failLifecycle(ExactWorkOrderLifecycleResult.Reason.INVARIANT_VIOLATION);
+        }
+        state = ExactWorkOrderState.COMPLETED;
+        return result;
     }
 
     private ExactWorkOrderCommandResult.Unavailable beginIssue() {
@@ -342,6 +521,20 @@ public final class ExactWorkOrder {
         if (!onServerThread()) {
             ExactWorkOrderTransitionResult.Failure failure = transitionFailure(
                     ExactWorkOrderTransitionResult.Reason.WRONG_THREAD);
+            entered = false;
+            return failure;
+        }
+        return null;
+    }
+
+    private ExactWorkOrderLifecycleResult.Failure beginLifecycle() {
+        if (entered) {
+            return lifecycleFailure(ExactWorkOrderLifecycleResult.Reason.REENTRANT);
+        }
+        entered = true;
+        if (!onServerThread()) {
+            ExactWorkOrderLifecycleResult.Failure failure = lifecycleFailure(
+                    ExactWorkOrderLifecycleResult.Reason.WRONG_THREAD);
             entered = false;
             return failure;
         }
@@ -385,6 +578,20 @@ public final class ExactWorkOrder {
     private ExactWorkOrderTransitionResult.Failure failTransitionInvariant() {
         state = ExactWorkOrderState.FAIL_CLOSED;
         return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
+    }
+
+    private ExactWorkOrderLifecycleResult.Failure lifecycleFailure(ExactWorkOrderLifecycleResult.Reason reason) {
+        return new ExactWorkOrderLifecycleResult.Failure(reason, snapshot());
+    }
+
+    private ExactWorkOrderLifecycleResult.Failure failLifecycle(ExactWorkOrderLifecycleResult.Reason reason) {
+        state = ExactWorkOrderState.FAIL_CLOSED;
+        return lifecycleFailure(reason);
+    }
+
+    private static boolean validMovedAmount(AEAmount moved, AEAmount requested) {
+        return moved != null && moved.toBigInteger().bitLength() <= PlannerLimits.MAX_CRAFT_QUANTITY_BITS
+                && moved.compareTo(AEAmount.ZERO) >= 0 && moved.compareTo(requested) <= 0;
     }
 
     /** Retains executor evidence as the recovery authority when bounded exact custody cannot aggregate it. */
