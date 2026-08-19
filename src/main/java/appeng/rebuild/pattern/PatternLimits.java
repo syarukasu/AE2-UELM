@@ -27,6 +27,10 @@ public final class PatternLimits {
     public static final int MAX_MACHINE_FIELD_LENGTH = 256;
     public static final int MAX_MACHINE_ATTRIBUTE_KEY_LENGTH = 128;
     public static final int MAX_MACHINE_ATTRIBUTE_VALUE_LENGTH = 256;
+    /** Maximum decoded legacy patterns staged by one provider reload. */
+    public static final int MAX_PATTERN_PROVIDER_PATTERNS = 65_536;
+    /** Maximum input candidates staged by one provider reload. */
+    public static final int MAX_PATTERN_PROVIDER_TOTAL_INPUT_CANDIDATES = 65_536;
 
     private PatternLimits() {
     }
