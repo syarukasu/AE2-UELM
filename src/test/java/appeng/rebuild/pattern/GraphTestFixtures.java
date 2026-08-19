@@ -33,7 +33,7 @@ final class GraphTestFixtures {
         SubstitutionPolicy policy = candidates.size() == 1
                 ? SubstitutionPolicy.EXACT
                 : SubstitutionPolicy.ALLOW_ALTERNATIVES;
-        return new CompiledInputSpec(candidates, policy);
+        return new CompiledInputSpec(candidates, AEAmount.ONE, policy);
     }
 
     static CompiledCandidateSpec candidate(int key) {

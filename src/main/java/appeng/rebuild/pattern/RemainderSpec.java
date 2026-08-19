@@ -5,11 +5,11 @@ import java.util.Objects;
 import appeng.api.stacks.AEKey;
 import appeng.rebuild.quantity.AEAmount;
 
-/** Exact non-zero remainder returned by one selected input candidate. */
-public record RemainderSpec(AEKey key, AEAmount amount) {
+/** Exact non-zero remainder returned for each selected input template unit. */
+public record RemainderSpec(AEKey key, AEAmount amountPerTemplate) {
     public RemainderSpec {
         Objects.requireNonNull(key, "key");
-        requirePositive(Objects.requireNonNull(amount, "amount"), "amount");
+        requirePositive(Objects.requireNonNull(amountPerTemplate, "amountPerTemplate"), "amountPerTemplate");
     }
 
     static void requirePositive(AEAmount amount, String name) {

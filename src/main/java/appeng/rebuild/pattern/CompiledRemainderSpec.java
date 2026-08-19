@@ -5,10 +5,11 @@ import java.util.Objects;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.quantity.AEAmount;
 
-/** Compiled exact remainder using a registry-scoped key id. */
-public record CompiledRemainderSpec(KeyId key, AEAmount amount) {
+/** Compiled exact remainder returned for each selected input template unit. */
+public record CompiledRemainderSpec(KeyId key, AEAmount amountPerTemplate) {
     public CompiledRemainderSpec {
         Objects.requireNonNull(key, "key");
-        RemainderSpec.requirePositive(Objects.requireNonNull(amount, "amount"), "amount");
+        RemainderSpec.requirePositive(Objects.requireNonNull(amountPerTemplate, "amountPerTemplate"),
+                "amountPerTemplate");
     }
 }

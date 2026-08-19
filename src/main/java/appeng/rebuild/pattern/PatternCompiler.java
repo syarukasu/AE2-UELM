@@ -20,8 +20,9 @@ public final class PatternCompiler {
     }
 
     /**
-     * Compiles without interning keys or mutating the source pattern. Unknown keys and rejected bounded shapes are
-     * reported explicitly, without returning a partial compiled pattern.
+     * Compiles without interning keys or mutating the source pattern. Candidate and remainder per-template amounts and
+     * input multipliers are copied independently without selection, aggregation, or multiplication. Unknown keys and
+     * rejected bounded shapes are reported explicitly, without returning a partial compiled pattern.
      */
     public PatternCompileResult compile(PatternDefinition definition) {
         Objects.requireNonNull(definition, "definition");
@@ -50,11 +51,12 @@ public final class PatternCompiler {
                         return PatternCompileResult.failure(PatternCompileResult.FailureReason.UNKNOWN_KEY,
                                 path + ".remainder.key", sourceRemainder.key());
                     }
-                    remainder = Optional.of(new CompiledRemainderSpec(remainderKey, sourceRemainder.amount()));
+                    remainder = Optional.of(new CompiledRemainderSpec(remainderKey,
+                            sourceRemainder.amountPerTemplate()));
                 }
-                candidates.add(new CompiledCandidateSpec(candidateKey, candidate.amountPerExecution(), remainder));
+                candidates.add(new CompiledCandidateSpec(candidateKey, candidate.amountPerTemplate(), remainder));
             }
-            inputs.add(new CompiledInputSpec(candidates, input.policy()));
+            inputs.add(new CompiledInputSpec(candidates, input.multiplier(), input.policy()));
         }
 
         List<CompiledOutputSpec> outputs = new ArrayList<>(definition.outputs().size());

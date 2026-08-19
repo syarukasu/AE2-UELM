@@ -21,6 +21,7 @@ import java.util.TreeSet;
 import org.junit.jupiter.api.Test;
 
 import appeng.rebuild.key.KeyId;
+import appeng.rebuild.quantity.AEAmount;
 
 /** Deterministic, bounded dependency graph and SCC contract tests. */
 class CompiledPatternGraphBuilderTest {
@@ -128,7 +129,7 @@ class CompiledPatternGraphBuilderTest {
         CompiledPattern consumer = pattern("consumer", KEY_REGISTRY_GENERATION,
                 List.of(new CompiledInputSpec(List.of(
                         candidateWithRemainder(10, 11),
-                        GraphTestFixtures.candidate(13)), SubstitutionPolicy.ALLOW_ALTERNATIVES)),
+                        GraphTestFixtures.candidate(13)), AEAmount.ONE, SubstitutionPolicy.ALLOW_ALTERNATIVES)),
                 List.of(output(14, true)));
 
         CompiledPatternGraph graph = success(List.of(consumer, secondarySource, remainderProducer, inputProducer))

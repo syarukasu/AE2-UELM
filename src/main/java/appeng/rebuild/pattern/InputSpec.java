@@ -3,10 +3,16 @@ package appeng.rebuild.pattern;
 import java.util.List;
 import java.util.Objects;
 
-/** Ordered candidate group for one pattern input. The first candidate is primary. */
-public record InputSpec(List<CandidateSpec> candidates, SubstitutionPolicy policy) {
+import appeng.rebuild.quantity.AEAmount;
+
+/**
+ * Ordered candidate group for one pattern input. The first candidate is primary; {@code multiplier} is the exact
+ * selected-template count and remains separate from every candidate's per-template amount.
+ */
+public record InputSpec(List<CandidateSpec> candidates, AEAmount multiplier, SubstitutionPolicy policy) {
     public InputSpec {
         candidates = List.copyOf(Objects.requireNonNull(candidates, "candidates"));
+        RemainderSpec.requirePositive(Objects.requireNonNull(multiplier, "multiplier"), "multiplier");
         Objects.requireNonNull(policy, "policy");
         if (candidates.isEmpty()) {
             throw new IllegalArgumentException("An input must have at least one candidate");

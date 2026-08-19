@@ -57,6 +57,7 @@ class PatternValueValidationTest {
         attributes.put("mutated", "source");
 
         assertEquals(1, input.candidates().size());
+        assertEquals(AEAmount.ONE, input.multiplier());
         assertEquals(1, definition.inputs().size());
         assertEquals(1, definition.outputs().size());
         assertEquals(List.of("a", "z"), new ArrayList<>(intent.attributes().keySet()));
@@ -71,7 +72,8 @@ class PatternValueValidationTest {
                 new KeyId(0),
                 AEAmount.of(5L),
                 Optional.of(new CompiledRemainderSpec(new KeyId(1), AEAmount.of(6L)))));
-        CompiledInputSpec compiledInput = new CompiledInputSpec(compiledCandidates, SubstitutionPolicy.EXACT);
+        CompiledInputSpec compiledInput = new CompiledInputSpec(compiledCandidates, AEAmount.ONE,
+                SubstitutionPolicy.EXACT);
         var compiledInputs = new ArrayList<CompiledInputSpec>();
         compiledInputs.add(compiledInput);
         var compiledOutputs = new ArrayList<CompiledOutputSpec>();
@@ -90,6 +92,7 @@ class PatternValueValidationTest {
         compiledOutputs.clear();
 
         assertEquals(1, compiledInput.candidates().size());
+        assertEquals(AEAmount.ONE, compiledInput.multiplier());
         assertEquals(1, compiled.inputs().size());
         assertEquals(1, compiled.outputs().size());
         assertThrows(UnsupportedOperationException.class, () -> compiledInput.candidates().clear());
@@ -120,6 +123,11 @@ class PatternValueValidationTest {
                 () -> new CompiledRemainderSpec(new KeyId(0), AEAmount.ZERO));
         assertThrows(IllegalArgumentException.class,
                 () -> new CompiledOutputSpec(new KeyId(0), AEAmount.ZERO, true));
+        assertThrows(IllegalArgumentException.class,
+                () -> new InputSpec(List.of(candidate(sourceKey, 1L)), AEAmount.ZERO, SubstitutionPolicy.EXACT));
+        assertThrows(IllegalArgumentException.class,
+                () -> new CompiledInputSpec(List.of(compiledCandidate(new KeyId(0), 1L)), AEAmount.ZERO,
+                        SubstitutionPolicy.EXACT));
     }
 
     @Test
@@ -129,18 +137,20 @@ class PatternValueValidationTest {
         InputSpec validInput = input(List.of(candidate(sourceKey, 1L)), SubstitutionPolicy.EXACT);
         CompiledInputSpec validCompiledInput = new CompiledInputSpec(
                 List.of(compiledCandidate(new KeyId(0), 1L)),
+                AEAmount.ONE,
                 SubstitutionPolicy.EXACT);
         CompiledOutputSpec validCompiledOutput = compiledOutput(new KeyId(0), 1L, true);
 
         assertThrows(IllegalArgumentException.class,
-                () -> new InputSpec(List.of(), SubstitutionPolicy.ALLOW_ALTERNATIVES));
+                () -> new InputSpec(List.of(), AEAmount.ONE, SubstitutionPolicy.ALLOW_ALTERNATIVES));
         assertThrows(IllegalArgumentException.class,
-                () -> new CompiledInputSpec(List.of(), SubstitutionPolicy.ALLOW_ALTERNATIVES));
+                () -> new CompiledInputSpec(List.of(), AEAmount.ONE, SubstitutionPolicy.ALLOW_ALTERNATIVES));
         assertThrows(IllegalArgumentException.class,
                 () -> input(List.of(candidate(sourceKey, 1L), candidate(secondKey, 2L)), SubstitutionPolicy.EXACT));
         assertThrows(IllegalArgumentException.class,
                 () -> new CompiledInputSpec(
                         List.of(compiledCandidate(new KeyId(0), 1L), compiledCandidate(new KeyId(1), 2L)),
+                        AEAmount.ONE,
                         SubstitutionPolicy.EXACT));
 
         assertThrows(IllegalArgumentException.class,
@@ -195,7 +205,7 @@ class PatternValueValidationTest {
                         List.of(input), outputs, Optional.empty(), new PatternRevision(0L)));
 
         CompiledInputSpec compiledInput = new CompiledInputSpec(
-                List.of(compiledCandidate(new KeyId(0), 1L)), SubstitutionPolicy.EXACT);
+                List.of(compiledCandidate(new KeyId(0), 1L)), AEAmount.ONE, SubstitutionPolicy.EXACT);
         List<CompiledOutputSpec> compiledOutputs = List.of(compiledOutput(new KeyId(0), 1L, true));
         assertThrows(IllegalArgumentException.class,
                 () -> new CompiledPattern(new PatternId("compiled-crafting-intent"), PatternKind.CRAFTING,
@@ -276,20 +286,23 @@ class PatternValueValidationTest {
                 List.of(output(sourceKey, 1L, true))));
 
         List<CompiledInputSpec> maxCompiledGroups = Collections.nCopies(PatternLimits.MAX_INPUT_GROUPS,
-                new CompiledInputSpec(List.of(compiledCandidate), SubstitutionPolicy.EXACT));
+                new CompiledInputSpec(List.of(compiledCandidate), AEAmount.ONE, SubstitutionPolicy.EXACT));
         List<CompiledOutputSpec> maxCompiledOutputs = compiledOutputs(PatternLimits.MAX_OUTPUTS);
         assertDoesNotThrow(() -> new CompiledPattern(new PatternId("max-compiled"), PatternKind.CRAFTING,
                 maxCompiledGroups, maxCompiledOutputs, Optional.empty(), new PatternRevision(0L), 1L));
         assertThrows(IllegalArgumentException.class, () -> new CompiledPattern(new PatternId("too-many-compiled"),
                 PatternKind.CRAFTING,
-                append(maxCompiledGroups, new CompiledInputSpec(List.of(compiledCandidate), SubstitutionPolicy.EXACT)),
+                append(maxCompiledGroups,
+                        new CompiledInputSpec(List.of(compiledCandidate), AEAmount.ONE, SubstitutionPolicy.EXACT)),
                 maxCompiledOutputs, Optional.empty(), new PatternRevision(0L), 1L));
         assertDoesNotThrow(() -> new CompiledInputSpec(
                 Collections.nCopies(PatternLimits.MAX_CANDIDATES_PER_INPUT, compiledCandidate),
+                AEAmount.ONE,
                 SubstitutionPolicy.ALLOW_ALTERNATIVES));
         assertThrows(IllegalArgumentException.class, () -> new CompiledInputSpec(
                 append(Collections.nCopies(PatternLimits.MAX_CANDIDATES_PER_INPUT, compiledCandidate),
                         compiledCandidate),
+                AEAmount.ONE,
                 SubstitutionPolicy.ALLOW_ALTERNATIVES));
     }
 
@@ -298,10 +311,12 @@ class PatternValueValidationTest {
         List<CompiledCandidateSpec> half = Collections.nCopies(
                 PatternLimits.MAX_TOTAL_CANDIDATES_PER_PATTERN / 2,
                 compiledCandidate(new KeyId(0), 1L));
-        CompiledInputSpec first = new CompiledInputSpec(half, SubstitutionPolicy.ALLOW_ALTERNATIVES);
-        CompiledInputSpec secondAtLimit = new CompiledInputSpec(half, SubstitutionPolicy.ALLOW_ALTERNATIVES);
+        CompiledInputSpec first = new CompiledInputSpec(half, AEAmount.ONE, SubstitutionPolicy.ALLOW_ALTERNATIVES);
+        CompiledInputSpec secondAtLimit = new CompiledInputSpec(half, AEAmount.ONE,
+                SubstitutionPolicy.ALLOW_ALTERNATIVES);
         CompiledInputSpec secondAboveLimit = new CompiledInputSpec(
-                append(half, compiledCandidate(new KeyId(0), 1L)), SubstitutionPolicy.ALLOW_ALTERNATIVES);
+                append(half, compiledCandidate(new KeyId(0), 1L)), AEAmount.ONE,
+                SubstitutionPolicy.ALLOW_ALTERNATIVES);
         List<CompiledOutputSpec> outputs = List.of(compiledOutput(new KeyId(0), 1L, true));
 
         assertDoesNotThrow(() -> new CompiledPattern(new PatternId("compiled-total-limit"), PatternKind.CRAFTING,

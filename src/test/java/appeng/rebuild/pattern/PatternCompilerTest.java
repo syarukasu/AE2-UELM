@@ -43,6 +43,7 @@ class PatternCompilerTest {
                         candidate(item, AEAmount.ONE, Optional.of(new RemainderSpec(itemRemainder, AEAmount.of(2L)))),
                         candidate(fluid, AEAmount.of(1000L),
                                 Optional.of(new RemainderSpec(fluidRemainder, AEAmount.of(333L))))),
+                        AEAmount.of(3L),
                         SubstitutionPolicy.ALLOW_ALTERNATIVES)),
                 List.of(output(item, 1L, true)));
 
@@ -50,13 +51,42 @@ class PatternCompilerTest {
         List<CompiledCandidateSpec> candidates = success.pattern().inputs().get(0).candidates();
 
         assertEquals(registry.lookup(item), candidates.get(0).key());
-        assertEquals(AEAmount.ONE, candidates.get(0).amountPerExecution());
+        assertEquals(AEAmount.of(3L), success.pattern().inputs().get(0).multiplier());
+        assertEquals(AEAmount.ONE, candidates.get(0).amountPerTemplate());
         assertEquals(registry.lookup(itemRemainder), candidates.get(0).remainder().orElseThrow().key());
-        assertEquals(AEAmount.of(2L), candidates.get(0).remainder().orElseThrow().amount());
+        assertEquals(AEAmount.of(2L), candidates.get(0).remainder().orElseThrow().amountPerTemplate());
         assertEquals(registry.lookup(fluid), candidates.get(1).key());
-        assertEquals(AEAmount.of(1000L), candidates.get(1).amountPerExecution());
+        assertEquals(AEAmount.of(1000L), candidates.get(1).amountPerTemplate());
         assertEquals(registry.lookup(fluidRemainder), candidates.get(1).remainder().orElseThrow().key());
-        assertEquals(AEAmount.of(333L), candidates.get(1).remainder().orElseThrow().amount());
+        assertEquals(AEAmount.of(333L), candidates.get(1).remainder().orElseThrow().amountPerTemplate());
+    }
+
+    @Test
+    void preservesExactInputMultipliersWithoutNarrowingOrAggregation() {
+        AEKey key = key("multiplier-boundaries");
+        KeyRegistry registry = new KeyRegistry(46L);
+        registry.intern(key);
+        AEAmount[] multipliers = {
+                AEAmount.of(Long.MAX_VALUE),
+                AEAmount.of(BigInteger.valueOf(Long.MAX_VALUE).add(BigInteger.ONE)),
+                AEAmount.of(BigInteger.ONE.shiftLeft(128)),
+                AEAmount.of(BigInteger.TEN.pow(1000))
+        };
+        List<InputSpec> inputs = new ArrayList<>();
+        for (AEAmount multiplier : multipliers) {
+            inputs.add(input(List.of(candidate(key, 1L)), multiplier, SubstitutionPolicy.EXACT));
+        }
+        PatternDefinition definition = crafting(
+                new PatternId("multiplier-boundaries"), inputs, List.of(output(key, 1L, true)));
+
+        PatternCompileResult.Success success = compileSuccess(registry, definition);
+
+        for (int index = 0; index < multipliers.length; index++) {
+            assertEquals(multipliers[index], definition.inputs().get(index).multiplier());
+            assertEquals(multipliers[index], success.pattern().inputs().get(index).multiplier());
+            assertEquals(AEAmount.ONE,
+                    success.pattern().inputs().get(index).candidates().get(0).amountPerTemplate());
+        }
     }
 
     @Test
@@ -86,9 +116,9 @@ class PatternCompilerTest {
         PatternCompileResult.Success success = compileSuccess(registry, definition);
         for (int index = 0; index < values.length; index++) {
             CompiledCandidateSpec compiled = success.pattern().inputs().get(0).candidates().get(index);
-            assertEquals(values[index], compiled.amountPerExecution());
-            assertEquals(values[index], compiled.remainder().orElseThrow().amount());
-            assertEquals(values[index], definition.inputs().get(0).candidates().get(index).amountPerExecution());
+            assertEquals(values[index], compiled.amountPerTemplate());
+            assertEquals(values[index], compiled.remainder().orElseThrow().amountPerTemplate());
+            assertEquals(values[index], definition.inputs().get(0).candidates().get(index).amountPerTemplate());
         }
         for (int index = 0; index < values.length; index++) {
             assertEquals(values[index], success.pattern().outputs().get(index).amountPerExecution());
@@ -104,6 +134,7 @@ class PatternCompilerTest {
         PatternDefinition definition = crafting(
                 new PatternId("unknown-key"),
                 List.of(input(List.of(candidate(known, 1L), candidate(unknown, 2L)),
+                        AEAmount.of(3L),
                         SubstitutionPolicy.ALLOW_ALTERNATIVES)),
                 List.of(output(known, 1L, true)));
 
@@ -115,6 +146,9 @@ class PatternCompilerTest {
         assertEquals(PatternCompileResult.FailureReason.UNKNOWN_KEY, failure.reason());
         assertEquals("inputs[0].candidates[1].key", failure.sourcePath());
         assertEquals(unknown, failure.keyOptional().orElseThrow());
+        assertEquals(AEAmount.of(3L), definition.inputs().get(0).multiplier());
+        assertEquals(AEAmount.of(1L), definition.inputs().get(0).candidates().get(0).amountPerTemplate());
+        assertEquals(AEAmount.of(2L), definition.inputs().get(0).candidates().get(1).amountPerTemplate());
         assertEquals(1, registry.size());
     }
 
@@ -181,7 +215,7 @@ class PatternCompilerTest {
             PatternDefinition definition = new PatternDefinition(
                     new PatternId("random-" + patternIndex),
                     PatternKind.CRAFTING,
-                    List.of(new InputSpec(sourceCandidates,
+                    List.of(new InputSpec(sourceCandidates, AEAmount.ONE,
                             candidateCount == 1 ? SubstitutionPolicy.EXACT : SubstitutionPolicy.ALLOW_ALTERNATIVES)),
                     sourceOutputs,
                     Optional.empty(),
@@ -194,13 +228,14 @@ class PatternCompilerTest {
                 ExpectedCandidate expected = expectedCandidates.get(candidateIndex);
                 CompiledCandidateSpec actual = success.pattern().inputs().get(0).candidates().get(candidateIndex);
                 assertEquals(expected.key(), actual.key());
-                assertEquals(expected.amount(), actual.amountPerExecution());
+                assertEquals(expected.amountPerTemplate(), actual.amountPerTemplate());
                 if (expected.remainder().isEmpty()) {
                     assertTrue(actual.remainder().isEmpty());
                 } else {
                     ExpectedRemainder expectedRemainder = expected.remainder().orElseThrow();
                     assertEquals(expectedRemainder.key(), actual.remainder().orElseThrow().key());
-                    assertEquals(expectedRemainder.amount(), actual.remainder().orElseThrow().amount());
+                    assertEquals(expectedRemainder.amountPerTemplate(),
+                            actual.remainder().orElseThrow().amountPerTemplate());
                 }
             }
             assertEquals(expectedOutputs.size(), success.pattern().outputs().size());
@@ -208,7 +243,7 @@ class PatternCompilerTest {
                 ExpectedOutput expected = expectedOutputs.get(outputIndex);
                 CompiledOutputSpec actual = success.pattern().outputs().get(outputIndex);
                 assertEquals(expected.key(), actual.key());
-                assertEquals(expected.amount(), actual.amountPerExecution());
+                assertEquals(expected.amountPerExecution(), actual.amountPerExecution());
                 assertEquals(expected.primary(), actual.primary());
             }
             assertEquals(45L, success.pattern().keyRegistryGeneration());
@@ -230,12 +265,13 @@ class PatternCompilerTest {
         };
     }
 
-    private record ExpectedCandidate(KeyId key, AEAmount amount, Optional<ExpectedRemainder> remainder) {
+    private record ExpectedCandidate(KeyId key, AEAmount amountPerTemplate,
+            Optional<ExpectedRemainder> remainder) {
     }
 
-    private record ExpectedRemainder(KeyId key, AEAmount amount) {
+    private record ExpectedRemainder(KeyId key, AEAmount amountPerTemplate) {
     }
 
-    private record ExpectedOutput(KeyId key, AEAmount amount, boolean primary) {
+    private record ExpectedOutput(KeyId key, AEAmount amountPerExecution, boolean primary) {
     }
 }

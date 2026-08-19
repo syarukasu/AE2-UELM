@@ -40,7 +40,11 @@ final class PatternTestFixtures {
     }
 
     static InputSpec input(List<CandidateSpec> candidates, SubstitutionPolicy policy) {
-        return new InputSpec(candidates, policy);
+        return input(candidates, AEAmount.ONE, policy);
+    }
+
+    static InputSpec input(List<CandidateSpec> candidates, AEAmount multiplier, SubstitutionPolicy policy) {
+        return new InputSpec(candidates, multiplier, policy);
     }
 
     static MachineIntent machineIntent() {
