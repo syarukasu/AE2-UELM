@@ -426,23 +426,25 @@ class ExactWorkOrderCommandCoreTest {
         assertEquals(ExactWorkOrderState.FAIL_CLOSED, closed.state());
         assertEquals(Map.of(OUTPUT, maximumBound), closed.custody());
         assertEquals(Optional.of(command), closed.completedEvidence().map(ExactCompletedCommandEvidence::command));
-        assertTrue(closed.completedEvidenceProgressApplied());
-        assertEquals(1, closed.causalStepIndex());
-        assertEquals(AEAmount.ZERO, closed.remainingExecutions());
+        assertTrue(!closed.completedEvidenceProgressApplied());
+        assertEquals(0, closed.causalStepIndex());
+        assertEquals(AEAmount.ONE, closed.remainingExecutions());
         assertTrue(closed.inFlightCommand().isEmpty());
     }
 
     @Test
-    void cycleManifestReturnsTypedUnsupportedWithoutMovingCustody() {
+    void cycleManifestIssuesBoundedCommandWithoutTouchingStorage() {
         CompiledPattern cycle = pattern("cycle-unsupported", List.of(input(1, 1L,
                 List.of(candidate(1, 1L, Optional.empty())), SubstitutionPolicy.EXACT)),
                 List.of(output(1, 2L, true)));
         Harness harness = normal("cycle-unsupported", cycle, snapshot(2, Map.of(1, AEAmount.ONE)), request(1, 5L));
         ExactWorkOrderSnapshot before = harness.workOrder().snapshot();
-        ExactWorkOrderCommandResult.CycleUnsupported result = assertInstanceOf(
-                ExactWorkOrderCommandResult.CycleUnsupported.class, harness.workOrder().issueNext(Long.MAX_VALUE));
-        assertEquals(before, result.snapshot());
-        assertEquals(before, harness.workOrder().snapshot());
+        ExactWorkOrderCommandResult.Issued result = assertInstanceOf(
+                ExactWorkOrderCommandResult.Issued.class, harness.workOrder().issueNext(Long.MAX_VALUE));
+        assertTrue(result.command().location().isCycle());
+        assertEquals(before.custody(), harness.workOrder().snapshot().custody());
+        harness.workOrder().reject(new WorkCommandRejection(result.command()));
+        assertEquals(before.custody(), harness.workOrder().snapshot().custody());
         assertEquals(0, harness.storage().totalTransferCalls() - harness.storage().brokerTransferCallsAtHandoff());
     }
 
@@ -464,8 +466,9 @@ class ExactWorkOrderCommandCoreTest {
     private static ExactWorkCommand foreign(ExactWorkCommand command) {
         WorkCommandId id = new WorkCommandId(command.id().planId(), command.id().leaseIdentity(),
                 command.id().workOrderId(), command.id().generation() + 100L);
-        return new ExactWorkCommand(id, command.handle(), command.reservationId(), command.batchId(), command.pattern(),
-                command.executionWindow(), command.plannedSelections(), command.custodyInputs(),
+        return new ExactWorkCommand(id, command.handle(), command.reservationId(), command.batchId(),
+                command.location(),
+                command.pattern(), command.executionWindow(), command.plannedSelections(), command.custodyInputs(),
                 command.expectedOutputSlots(), command.expectedOutputs(), command.expectedRemainders());
     }
 

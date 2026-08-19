@@ -206,16 +206,20 @@ class ExactWorkCommandSchemaTest {
     @Test
     void nullsAreRejectedAtEveryCommandAndSlotBoundary() {
         assertThrows(NullPointerException.class, () -> new ExactWorkCommand(null, HANDLE, RESERVATION_ID, BATCH_ID,
-                FIXTURE.pattern(), 3L, FIXTURE.selections(), FIXTURE.custody(), FIXTURE.slots(), FIXTURE.outputs(),
+                ExactWorkCommandLocation.normal(0, AEAmount.of(3L)), FIXTURE.pattern(), 3L, FIXTURE.selections(),
+                FIXTURE.custody(), FIXTURE.slots(), FIXTURE.outputs(),
                 FIXTURE.remainders()));
         assertThrows(NullPointerException.class, () -> new ExactWorkCommand(new WorkCommandId(PLAN_ID, LEASE_ID,
-                WORK_ORDER_ID, 19L), null, RESERVATION_ID, BATCH_ID, FIXTURE.pattern(), 3L, FIXTURE.selections(),
+                WORK_ORDER_ID, 19L), null, RESERVATION_ID, BATCH_ID,
+                ExactWorkCommandLocation.normal(0, AEAmount.of(3L)), FIXTURE.pattern(), 3L, FIXTURE.selections(),
                 FIXTURE.custody(), FIXTURE.slots(), FIXTURE.outputs(), FIXTURE.remainders()));
         assertThrows(NullPointerException.class, () -> new ExactWorkCommand(new WorkCommandId(PLAN_ID, LEASE_ID,
-                WORK_ORDER_ID, 19L), HANDLE, null, BATCH_ID, FIXTURE.pattern(), 3L, FIXTURE.selections(),
+                WORK_ORDER_ID, 19L), HANDLE, null, BATCH_ID, ExactWorkCommandLocation.normal(0, AEAmount.of(3L)),
+                FIXTURE.pattern(), 3L, FIXTURE.selections(),
                 FIXTURE.custody(), FIXTURE.slots(), FIXTURE.outputs(), FIXTURE.remainders()));
         assertThrows(NullPointerException.class, () -> new ExactWorkCommand(new WorkCommandId(PLAN_ID, LEASE_ID,
-                WORK_ORDER_ID, 19L), HANDLE, RESERVATION_ID, null, FIXTURE.pattern(), 3L, FIXTURE.selections(),
+                WORK_ORDER_ID, 19L), HANDLE, RESERVATION_ID, null, ExactWorkCommandLocation.normal(0, AEAmount.of(3L)),
+                FIXTURE.pattern(), 3L, FIXTURE.selections(),
                 FIXTURE.custody(), FIXTURE.slots(), FIXTURE.outputs(), FIXTURE.remainders()));
         assertThrows(NullPointerException.class, () -> command(null, FIXTURE.custody(), FIXTURE.slots(),
                 FIXTURE.outputs(), FIXTURE.remainders(), FIXTURE.pattern()));
@@ -302,7 +306,8 @@ class ExactWorkCommandSchemaTest {
             List<ExactWorkOutput> slots, Map<KeyId, AEAmount> outputs, Map<KeyId, AEAmount> remainders,
             CompiledPattern pattern) {
         return new ExactWorkCommand(new WorkCommandId(PLAN_ID, LEASE_ID, WORK_ORDER_ID, 19L), HANDLE,
-                RESERVATION_ID, BATCH_ID, pattern, 3L, selections, custody, slots, outputs, remainders);
+                RESERVATION_ID, BATCH_ID, ExactWorkCommandLocation.normal(0, AEAmount.of(3L)), pattern, 3L,
+                selections, custody, slots, outputs, remainders);
     }
 
     private static ExactWorkCommand commandWithOutputAmount(AEAmount outputAmount) {
@@ -315,7 +320,8 @@ class ExactWorkCommandSchemaTest {
         PlannedInputSelection selection = new PlannedInputSelection(0, 0, AEAmount.ONE, INPUT_A, AEAmount.ONE,
                 AEAmount.ONE, Optional.empty());
         return new ExactWorkCommand(new WorkCommandId(PLAN_ID, LEASE_ID, WORK_ORDER_ID, 19L), HANDLE,
-                RESERVATION_ID, BATCH_ID, pattern, 1L, List.of(selection), Map.of(INPUT_A, AEAmount.ONE),
+                RESERVATION_ID, BATCH_ID, ExactWorkCommandLocation.normal(0, AEAmount.ONE), pattern, 1L,
+                List.of(selection), Map.of(INPUT_A, AEAmount.ONE),
                 List.of(new ExactWorkOutput(0, OUTPUT, outputAmount)), Map.of(OUTPUT, outputAmount), Map.of());
     }
 
