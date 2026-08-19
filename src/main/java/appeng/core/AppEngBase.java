@@ -85,6 +85,7 @@ import appeng.init.internal.InitUpgrades;
 import appeng.init.worldgen.InitStructures;
 import appeng.integration.Integrations;
 import appeng.items.tools.MemoryCardItem;
+import appeng.rebuild.pattern.RecipeReloadCoordinator;
 import appeng.recipes.AERecipeTypes;
 import appeng.server.AECommand;
 import appeng.server.services.ChunkLoadingService;
@@ -109,6 +110,7 @@ public abstract class AppEngBase implements AppEng {
      * out which player it's for.
      */
     private final ThreadLocal<Player> partInteractionPlayer = new ThreadLocal<>();
+    private final RecipeReloadCoordinator recipeReloadCoordinator = RecipeReloadCoordinator.instance();
 
     static AppEngBase INSTANCE;
 
@@ -165,6 +167,11 @@ public abstract class AppEngBase implements AppEng {
         MinecraftForge.EVENT_BUS.addListener(this::onServerAboutToStart);
         MinecraftForge.EVENT_BUS.addListener(this::serverStopped);
         MinecraftForge.EVENT_BUS.addListener(this::serverStopping);
+        MinecraftForge.EVENT_BUS.addListener(this.recipeReloadCoordinator::onAddReloadListener);
+        MinecraftForge.EVENT_BUS.addListener(this.recipeReloadCoordinator::onServerAboutToStart);
+        MinecraftForge.EVENT_BUS.addListener(this.recipeReloadCoordinator::onServerStopping);
+        MinecraftForge.EVENT_BUS.addListener(this.recipeReloadCoordinator::onServerStopped);
+        MinecraftForge.EVENT_BUS.addListener(EventPriority.LOWEST, this.recipeReloadCoordinator::onServerTick);
         MinecraftForge.EVENT_BUS.addListener(this::registerCommands);
 
         MinecraftForge.EVENT_BUS.addListener(WrenchHook::onPlayerUseBlockEvent);
