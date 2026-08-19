@@ -23,6 +23,8 @@ public final class ExactCpuLedger {
     private long lifecycleRevision;
     private CpuPlanHandle handle;
     private ExactCraftingPlan preparedPlan;
+    /** Immutable sealed authority retained until every recoverable resource obligation is cleared. */
+    private ExactCraftingPlan recoveryPlan;
     private ExactReservationReceipt receipt;
     private ReleaseObligation releaseObligation;
     private ReservedPlanLease lease;
@@ -46,6 +48,7 @@ public final class ExactCpuLedger {
         lifecycleRevision = Math.incrementExact(lifecycleRevision);
         handle = new CpuPlanHandle(ledgerIdentity, lifecycleRevision);
         preparedPlan = plan;
+        recoveryPlan = plan;
         state = ExactCpuLedgerState.PREPARED;
         return new ExactCpuLedgerResult.Prepared(handle);
     }
@@ -173,6 +176,11 @@ public final class ExactCpuLedger {
                 Optional.ofNullable(lease).map(ReservedPlanLease::leaseIdentity));
     }
 
+    /** Package recovery seam: immutable plan authority only; it never touches storage or advances the ledger. */
+    synchronized ExactCraftingPlan recoveryPlan() {
+        return recoveryPlan;
+    }
+
     private ExactCpuLedgerResult.Failure checkStateAndHandle(ExactCpuLedgerState requiredState,
             CpuPlanHandle expectedHandle) {
         if (state == ExactCpuLedgerState.FAIL_CLOSED) {
@@ -190,6 +198,7 @@ public final class ExactCpuLedger {
     private void clearToIdle() {
         handle = null;
         preparedPlan = null;
+        recoveryPlan = null;
         receipt = null;
         releaseObligation = null;
         lease = null;
@@ -199,6 +208,7 @@ public final class ExactCpuLedger {
     private void failClosed() {
         handle = null;
         preparedPlan = null;
+        recoveryPlan = null;
         receipt = null;
         releaseObligation = null;
         lease = null;

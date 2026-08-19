@@ -326,6 +326,14 @@ public final class ExactWorkOrder {
                 completedEvidenceProgressApplied);
     }
 
+    /**
+     * Read-only admission check for aggregate recovery capture. It deliberately does not issue, release, settle, or
+     * acknowledge work; callers must use it only from the server-thread, non-reentrant checkpoint boundary.
+     */
+    synchronized boolean recoveryCaptureAllowed() {
+        return !entered && onServerThread();
+    }
+
     private ExactWorkOrderSnapshot snapshotFor(ExactWorkOrderState proposedState, Map<KeyId, AEAmount> proposedCustody,
             WorkProgress progress) {
         return new ExactWorkOrderSnapshot(proposedState, lease.planId(), lease.handle(), lease.reservationId(),

@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -13,6 +14,7 @@ import static org.mockito.Mockito.when;
 import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -91,6 +93,18 @@ class ExactCraftingPlanNbtCodecTest {
         assertEquals(3, current.size());
         assertEquals(new ExactPlanId(fixture.plan().planId().value()), fixture.plan().planId());
         assertUnmodifiable(fixture.plan());
+    }
+
+    @Test
+    void publicEncodingPayloadMatchesThePayloadAfterRemovingItsOuterKeyTable() {
+        NormalFixture fixture = normalFixture();
+        CompoundTag publicEncoding = ExactCraftingPlanNbtCodec.encode(fixture.plan(), fixture.source());
+        CompoundTag payload = publicEncoding.copy();
+
+        assertTrue(payload.contains("k"));
+        payload.remove("k");
+        assertFalse(payload.contains("k"));
+        assertEquals(ExactCraftingPlanNbtCodec.encodePayload(fixture.plan()), payload);
     }
 
     @Test
@@ -256,6 +270,77 @@ class ExactCraftingPlanNbtCodecTest {
                     PersistenceDecodeResult.Reason.MALFORMED);
             assertEquals(0, current.size());
         }
+    }
+
+    @Test
+    void prospectivePayloadAcceptsStrictOuterKeySupersetWithoutRegistryMutationUntilCommit() {
+        CycleFixture fixture = cycleFixture(AEAmount.ONE);
+        AEKey extra = mock(AEKey.class);
+        when(extra.toTagGeneric()).thenReturn(identity("codec:outer-only"));
+        PersistedKeyTable outerTable = new PersistedKeyTable(KEY_GENERATION, List.of(
+                new PersistedKeyTable.Entry(new KeyId(0), fixture.keys().get(0)),
+                new PersistedKeyTable.Entry(new KeyId(9), extra)));
+        KeyRegistry current = new KeyRegistry(CURRENT_KEY_GENERATION);
+
+        PersistenceDecodeResult.Success<ExactCraftingPlanNbtCodec.ProspectivePlan> prospectiveResult = assertInstanceOf(
+                PersistenceDecodeResult.Success.class,
+                ExactCraftingPlanNbtCodec.decodeProspectivePayload(
+                        ExactCraftingPlanNbtCodec.encodePayload(fixture.plan()),
+                        outerTable, current));
+        ExactCraftingPlanNbtCodec.ProspectivePlan prospective = prospectiveResult.value();
+
+        assertEquals(0, current.size(), "prospective payload decode must not intern current identities");
+        assertEquals(2, prospective.remap().mappings().size(), "outer table remains the shared remap closure");
+        assertEquals(new KeyId(0), prospective.remap().require(new KeyId(0)));
+        assertEquals(new KeyId(1), prospective.remap().require(new KeyId(9)));
+        assertEquals(new KeyId(0), prospective.plan().request().output());
+
+        KeyTableRebinder.commit(outerTable, current, prospective.remap());
+        assertEquals(2, current.size());
+        assertEquals(new KeyId(0), current.lookup(fixture.keys().get(0)));
+        assertEquals(new KeyId(1), current.lookup(extra));
+    }
+
+    @Test
+    void prospectivePayloadMissingPlanKeyFailsBeforeRegistryMutation() {
+        CycleFixture fixture = cycleFixture(AEAmount.ONE);
+        AEKey unrelated = mock(AEKey.class);
+        when(unrelated.toTagGeneric()).thenReturn(identity("codec:unrelated"));
+        PersistedKeyTable missingPlanKey = new PersistedKeyTable(KEY_GENERATION,
+                List.of(new PersistedKeyTable.Entry(new KeyId(9), unrelated)));
+        KeyRegistry current = new KeyRegistry(CURRENT_KEY_GENERATION);
+
+        PersistenceDecodeResult<?> result = ExactCraftingPlanNbtCodec.decodeProspectivePayload(
+                ExactCraftingPlanNbtCodec.encodePayload(fixture.plan()), missingPlanKey, current);
+
+        assertFailure(result, PersistenceDecodeResult.Reason.MALFORMED);
+        assertEquals(0, current.size());
+    }
+
+    @Test
+    void forgedDuplicateTargetCannotCommitProspectivePayloadAndLeavesRegistryUnchanged() {
+        CycleFixture fixture = cycleFixture(AEAmount.ONE);
+        AEKey extra = mock(AEKey.class);
+        when(extra.toTagGeneric()).thenReturn(identity("codec:collision-extra"));
+        PersistedKeyTable outerTable = new PersistedKeyTable(KEY_GENERATION, List.of(
+                new PersistedKeyTable.Entry(new KeyId(0), fixture.keys().get(0)),
+                new PersistedKeyTable.Entry(new KeyId(9), extra)));
+        KeyRegistry current = new KeyRegistry(CURRENT_KEY_GENERATION);
+        PersistenceDecodeResult.Success<ExactCraftingPlanNbtCodec.ProspectivePlan> prospectiveResult = assertInstanceOf(
+                PersistenceDecodeResult.Success.class,
+                ExactCraftingPlanNbtCodec.decodeProspectivePayload(
+                        ExactCraftingPlanNbtCodec.encodePayload(fixture.plan()),
+                        outerTable, current));
+        ExactCraftingPlanNbtCodec.ProspectivePlan prospective = prospectiveResult.value();
+
+        Map<KeyId, KeyId> duplicateTargets = new LinkedHashMap<>();
+        duplicateTargets.put(new KeyId(0), new KeyId(0));
+        duplicateTargets.put(new KeyId(9), new KeyId(0));
+        ExactKeyRemap forged = new ExactKeyRemap(KEY_GENERATION, CURRENT_KEY_GENERATION, duplicateTargets, 2);
+
+        assertThrows(IllegalArgumentException.class, () -> KeyTableRebinder.commit(outerTable, current, forged));
+        assertEquals(0, current.size(), "failed duplicate-target commit must be atomic");
+        assertEquals(2, prospective.remap().mappings().size());
     }
 
     private static NormalFixture normalFixture() {

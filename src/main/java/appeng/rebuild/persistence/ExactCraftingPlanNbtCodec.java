@@ -72,6 +72,63 @@ public final class ExactCraftingPlanNbtCodec {
     private ExactCraftingPlanNbtCodec() {
     }
 
+    /** Package aggregate-checkpoint seam: strict plan payload without an embedded key table. */
+    static CompoundTag encodePayload(ExactCraftingPlan plan) {
+        if (plan == null)
+            throw new IllegalArgumentException("plan is required");
+        CompoundTag root = new CompoundTag();
+        StrictNbt.Budget budget = StrictNbt.budget();
+        if (!budget.reserve(128, 13))
+            throw new IllegalArgumentException("Plan payload header exceeds persistence limits");
+        root.putInt(VERSION, PersistenceLimits.FORMAT_VERSION);
+        putBounded(root, ID, uuid(plan.planId().value()), budget);
+        putBounded(root, PLANNING, revision(plan.planningRevision()), budget);
+        putBounded(root, VALIDATION, revision(plan.validationRevision()), budget);
+        putBounded(root, REQUEST, request(plan.request()), budget);
+        putBounded(root, STEPS, list(plan.causalSteps(), ExactCraftingPlanNbtCodec::step), budget);
+        putBounded(root, MANIFESTS, list(plan.executionManifests(), ExactCraftingPlanNbtCodec::manifest), budget);
+        putBounded(root, USED, patternRevisionMap(plan.usedPatternRevisions()), budget);
+        putBounded(root, EXECUTIONS, patternAmountMap(plan.patternExecutions()), budget);
+        putBounded(root, DEBITS, keyAmountMap(plan.initialStorageDebits()), budget);
+        putBounded(root, SURPLUS, keyAmountMap(plan.finalSurplus()), budget);
+        putBounded(root, DEPENDENCIES, dependencies(plan.dependencies()), budget);
+        requireValid(root);
+        return root;
+    }
+
+    /** Package aggregate-checkpoint seam: no registry mutation; caller commits the returned shared remap last. */
+    static PersistenceDecodeResult<ProspectivePlan> decodeProspectivePayload(CompoundTag payload,
+            PersistedKeyTable outerTable, KeyRegistry current) {
+        if (payload == null || outerTable == null || current == null || !StrictNbt.valid(payload))
+            return malformed();
+        if (!shape(payload, 12, VERSION, Tag.TAG_INT, ID, Tag.TAG_COMPOUND, PLANNING, Tag.TAG_COMPOUND,
+                VALIDATION, Tag.TAG_COMPOUND, REQUEST, Tag.TAG_COMPOUND, STEPS, Tag.TAG_LIST, MANIFESTS,
+                Tag.TAG_LIST, USED, Tag.TAG_COMPOUND, EXECUTIONS, Tag.TAG_COMPOUND, DEBITS, Tag.TAG_COMPOUND,
+                SURPLUS, Tag.TAG_COMPOUND, DEPENDENCIES, Tag.TAG_COMPOUND))
+            return malformed();
+        if (payload.getInt(VERSION) != PersistenceLimits.FORMAT_VERSION)
+            return unsupported();
+        PersistenceDecodeResult<OldPlan> decoded = oldPlan(payload);
+        if (!(decoded instanceof PersistenceDecodeResult.Success<OldPlan> success))
+            return propagate(decoded);
+        OldPlan old = success.value();
+        if (old.planning.keyRegistryGeneration() != outerTable.generation()
+                || old.validation.keyRegistryGeneration() != outerTable.generation()
+                || old.dependencies.gridRevision().keyRegistryGeneration() != outerTable.generation())
+            return generation();
+        if (!ids(outerTable.entries()).containsAll(old.keyIds()))
+            return malformed();
+        try {
+            ExactKeyRemap remap = KeyTableRebinder.prospective(outerTable, current);
+            return new PersistenceDecodeResult.Success<>(new ProspectivePlan(old.rebind(remap), remap));
+        } catch (RuntimeException failure) {
+            return malformed();
+        }
+    }
+
+    record ProspectivePlan(ExactCraftingPlan plan, ExactKeyRemap remap) {
+    }
+
     /** Encodes all authority-free sealed data, including the exact sparse key closure. */
     public static CompoundTag encode(ExactCraftingPlan plan, KeyRegistry registry) {
         if (plan == null || registry == null)
