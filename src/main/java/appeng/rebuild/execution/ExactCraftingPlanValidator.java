@@ -108,8 +108,12 @@ public final class ExactCraftingPlanValidator {
         }
         validateStorageDebits(draft, summary.debits, storage, work);
 
+        List<ExecutionManifest> manifests = new ArrayList<>(data.size());
+        for (StepData step : data) {
+            manifests.add(step.manifest);
+        }
         return new ExactPlanValidationResult.Success(new ExactCraftingPlan(ExactPlanId.fresh(), draft.gridRevision(),
-                validationRevision, draft.request(), steps, usedRevisions, executions, summary.debits,
+                validationRevision, draft.request(), steps, manifests, usedRevisions, executions, summary.debits,
                 summary.surplus, draft.dependencies()));
     }
 
@@ -131,7 +135,8 @@ public final class ExactCraftingPlanValidator {
             add(initial, selection.consumedKey(), selection.initialRequiredAmount(), work);
         }
         add(executions, pattern.id(), count, work);
-        return new StepData(outputs, initial, selections.byIdentity, Set.of());
+        return new StepData(outputs, initial, selections.byIdentity, Set.of(), new NormalExecutionManifest(batch.id(),
+                batch.cause(), new SealedPatternExecution(pattern, count, batch.inputs(), List.of())));
     }
 
     private StepData validateCycle(PlannedCycleBatch cycle, NormalizedPatternSnapshot patterns,
@@ -145,6 +150,7 @@ public final class ExactCraftingPlanValidator {
         AEAmount repetitions = amount(cycle.repetitions());
         AEAmount seed = amount(cycle.seedAmount());
         List<CompiledPattern> compiled = new ArrayList<>(members.size());
+        List<SealedPatternExecution> sealedMembers = new ArrayList<>(members.size());
         List<SelectionData> selections = new ArrayList<>(members.size());
         List<Map<Integer, PlannedCycleOutput>> outputsBySlot = new ArrayList<>(members.size());
         Map<KeyId, AEAmount> perTurnCredits = newKeyAmounts();
@@ -166,6 +172,8 @@ public final class ExactCraftingPlanValidator {
             add(executions, pattern.id(), multiply(perTurnExecutions, repetitions, work), work);
             Map<Integer, PlannedCycleOutput> slots = validateCycleOutputs(member, pattern, perTurnCredits, work);
             outputsBySlot.add(slots);
+            sealedMembers.add(new SealedPatternExecution(pattern, perTurnExecutions, member.inputsPerTurn(),
+                    member.outputsPerTurn()));
             for (PlannedInputSelection selection : memberSelections.byIdentity.values()) {
                 selection.remainderReturn().ifPresent(remainder -> add(perTurnCredits, remainder.key(),
                         remainder.amount(), work));
@@ -236,7 +244,8 @@ public final class ExactCraftingPlanValidator {
                 }
             }
         }
-        return new StepData(finalCredits, initial, allSelections, linked);
+        return new StepData(finalCredits, initial, allSelections, linked, new CycleExecutionManifest(cycle.id(),
+                cycle.cause(), repetitions, cycle.seedKey(), seed, sealedMembers, cycle.links(), cycle.finalCredits()));
     }
 
     private CompiledPattern resolve(PatternId id, NormalizedPatternSnapshot patterns,
@@ -697,7 +706,8 @@ public final class ExactCraftingPlanValidator {
     }
 
     private record StepData(Map<KeyId, AEAmount> outputs, Map<KeyId, AEAmount> initialInputs,
-            Map<SelectionRef, PlannedInputSelection> selections, Set<SelectionRef> linkedSelections) {
+            Map<SelectionRef, PlannedInputSelection> selections, Set<SelectionRef> linkedSelections,
+            ExecutionManifest manifest) {
         private StepData {
             TreeMap<KeyId, AEAmount> sortedOutputs = new TreeMap<>(Comparator.comparingInt(KeyId::value));
             sortedOutputs.putAll(outputs);
@@ -707,6 +717,7 @@ public final class ExactCraftingPlanValidator {
             initialInputs = Collections.unmodifiableMap(sortedInputs);
             selections = Collections.unmodifiableMap(new HashMap<>(selections));
             linkedSelections = Set.copyOf(linkedSelections);
+            Objects.requireNonNull(manifest, "manifest");
         }
     }
 
