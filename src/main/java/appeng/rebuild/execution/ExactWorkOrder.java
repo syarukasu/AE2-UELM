@@ -94,6 +94,84 @@ public final class ExactWorkOrder {
     }
 
     /**
+     * Reconstructs only a checkpoint which has already been classified as physically unambiguous. This does not contact
+     * the executor or storage and retains a previously issued command as data; it never reissues it.
+     */
+    static ExactWorkOrder restoreFromRecovery(ExactWorkOrderSnapshot recovered, ReservedPlanLease lease,
+            BrokerExactStorage storage, ServerThreadGate serverThread, IActionSource actionSource,
+            ExactCpuLedger ledger, ExactTransferBroker ownerBroker) {
+        Objects.requireNonNull(recovered, "recovered");
+        Objects.requireNonNull(lease, "lease");
+        if (!recovered.planId().equals(lease.planId()) || !recovered.handle().equals(lease.handle())
+                || !recovered.reservationId().equals(lease.reservationId())
+                || !recovered.leaseIdentity().equals(lease.leaseIdentity())) {
+            throw new IllegalArgumentException("Recovery work order differs from its sealed lease");
+        }
+        if (recovered.inFlightCommand().isPresent() || recovered.discrepancy().isPresent()
+                || recovered.completedEvidence().isPresent() || recovered.transferDiscrepancy().isPresent()
+                || recovered.state() == ExactWorkOrderState.FAIL_CLOSED
+                || recovered.state() == ExactWorkOrderState.CANCEL_PENDING) {
+            throw new IllegalArgumentException("Ambiguous work-order evidence cannot be activated");
+        }
+        ExactWorkOrder result = new ExactWorkOrder(recovered.workOrderId(), lease, lease.reservedDebits(), storage,
+                serverThread, actionSource, ledger, ownerBroker);
+        result.custody = new TreeMap<>(KEY_ORDER);
+        result.custody.putAll(ExactReservationReceipt.copyDebitsOrEmpty(recovered.custody(), "recovery custody"));
+        result.state = recovered.state();
+        result.causalStepIndex = recovered.causalStepIndex();
+        result.remainingExecutions = recovered.remainingExecutions();
+        result.selectionRemaining = recovered.selectionRemaining();
+        result.cycleRemainingRepetitions = recovered.cycleRemainingRepetitions();
+        result.cycleMemberIndex = recovered.cycleMemberIndex();
+        result.cycleMemberRemainingExecutions = recovered.cycleMemberRemainingExecutions();
+        result.cycleSelectionRemaining = recovered.cycleSelectionRemaining();
+        result.releaseMode = recovered.releaseMode().orElse(null);
+        result.nextGeneration = recovered.nextGeneration();
+        result.generationExhausted = recovered.generationExhausted();
+        result.outstanding = recovered.outstandingCommand().map(result::recoveryIssued).orElse(null);
+        if (result.state == ExactWorkOrderState.COMMAND_OUTSTANDING && result.outstanding == null) {
+            throw new IllegalArgumentException("Outstanding recovery work order lacks command");
+        }
+        if (result.state != ExactWorkOrderState.COMMAND_OUTSTANDING && result.outstanding != null) {
+            throw new IllegalArgumentException("Recovery command does not match work-order state");
+        }
+        // Constructing a detached snapshot is a final, pure shape check before this object becomes reachable.
+        if (!result.snapshot().equals(recovered)) {
+            throw new IllegalArgumentException("Recovery work-order reconstruction changed durable state");
+        }
+        return result;
+    }
+
+    private IssuedCommand recoveryIssued(ExactWorkCommand command) {
+        if (causalStepIndex < 0 || causalStepIndex >= manifests.size()) {
+            throw new IllegalArgumentException("Recovery command has no sealed causal step");
+        }
+        ExecutionManifest manifest = manifests.get(causalStepIndex);
+        SealedPatternExecution sealed;
+        List<AEAmount> cursor;
+        if (command.location().isCycle()) {
+            if (!(manifest instanceof CycleExecutionManifest cycle)
+                    || command.location().cycleMemberIndex() != cycleMemberIndex
+                    || cycleMemberIndex < 0 || cycleMemberIndex >= cycle.memberExecutions().size()) {
+                throw new IllegalArgumentException("Recovery cycle command differs from current sealed cursor");
+            }
+            sealed = cycle.memberExecutions().get(cycleMemberIndex);
+            cursor = cycleSelectionRemaining;
+        } else {
+            if (!(manifest instanceof NormalExecutionManifest normal)) {
+                throw new IllegalArgumentException("Recovery normal command differs from current sealed cursor");
+            }
+            sealed = normal.execution();
+            cursor = selectionRemaining;
+        }
+        if (command.pattern() != sealed.pattern()) {
+            throw new IllegalArgumentException("Recovery command pattern is not the sealed manifest pattern");
+        }
+        return new IssuedCommand(command, ProgressDelta.from(sealed.plannedSelections(), cursor,
+                command.plannedSelections(), command.executionWindow()));
+    }
+
+    /**
      * Seals the next bounded normal-manifest execution instruction without consulting live storage or recipes. Rejected
      * instructions retain all selection progress and custody; command generations are intentionally not reusable
      * identities.

@@ -52,6 +52,52 @@ public final class ExactTransferBroker {
         this.actionSource = Objects.requireNonNull(actionSource, "actionSource");
     }
 
+    /**
+     * Assignment-only recovery seam. It neither captures snapshots nor invokes storage; callers must first admit the
+     * server thread and reject every checkpoint which carries ambiguous physical evidence.
+     */
+    static ExactTransferBroker restoreFromRecovery(ExactCpuLedger recoveredLedger, ExactCraftingPlan plan,
+            ExactTransferBrokerSnapshot recovered, BrokerExactStorage storage,
+            CurrentPatternSnapshotSource patternSnapshots, ServerThreadGate serverThread, IActionSource actionSource) {
+        Objects.requireNonNull(recoveredLedger, "recoveredLedger");
+        Objects.requireNonNull(plan, "plan");
+        Objects.requireNonNull(recovered, "recovered");
+        ExactTransferBroker result = new ExactTransferBroker(storage, patternSnapshots, serverThread, actionSource);
+        if (recovered.state() == ExactTransferBrokerState.FAIL_CLOSED
+                || recovered.state() == ExactTransferBrokerState.IDLE
+                || recovered.state() == ExactTransferBrokerState.PREFLIGHT
+                || recovered.state() == ExactTransferBrokerState.EXTRACTING) {
+            throw new IllegalArgumentException("Unsafe broker state cannot be activated");
+        }
+        result.handle = recovered.handle()
+                .orElseThrow(() -> new IllegalArgumentException("Recovery broker lacks handle"));
+        result.planId = recovered.planId()
+                .orElseThrow(() -> new IllegalArgumentException("Recovery broker lacks plan identity"));
+        result.reservationId = recovered.reservationId()
+                .orElseThrow(() -> new IllegalArgumentException("Recovery broker lacks reservation identity"));
+        if (!result.planId.equals(plan.planId())
+                || !result.handle.equals(recoveredLedger.snapshot().handle().orElse(null))) {
+            throw new IllegalArgumentException("Recovery broker differs from recovered ledger/plan");
+        }
+        result.escrowed.putAll(ExactReservationReceipt.copyDebitsOrEmpty(recovered.escrowed(), "recovery escrow"));
+        result.workOrderId = recovered.workOrderId().orElse(null);
+        result.leaseIdentity = recovered.leaseIdentity().orElse(null);
+        result.state = recovered.state();
+        if (result.state == ExactTransferBrokerState.LEASED) {
+            if (!result.escrowed.isEmpty() || result.workOrderId == null || result.leaseIdentity == null) {
+                throw new IllegalArgumentException("Leased recovery broker has invalid custody or identities");
+            }
+            // Normal broker operation clears this reference after the irreversible CPU handoff.
+            result.ledger = null;
+        } else {
+            if (result.workOrderId != null || result.leaseIdentity != null) {
+                throw new IllegalArgumentException("Pre-handoff recovery broker retains lease identities");
+            }
+            result.ledger = recoveredLedger;
+        }
+        return result;
+    }
+
     /** Reserves the exact initial debit of the handle-bound prepared plan. */
     synchronized ExactTransferBrokerResult reserve(ExactCpuLedger requestedLedger, CpuPlanHandle requestedHandle) {
         ExactTransferBrokerResult.Failure admission = beginOperation();

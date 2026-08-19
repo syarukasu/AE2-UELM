@@ -17,7 +17,7 @@ import appeng.rebuild.quantity.AEAmount;
  * broker performs physical reservation, release, and work-order execution around the immutable values produced here.
  */
 public final class ExactCpuLedger {
-    private final UUID ledgerIdentity = UUID.randomUUID();
+    private final UUID ledgerIdentity;
 
     private ExactCpuLedgerState state = ExactCpuLedgerState.IDLE;
     private long lifecycleRevision;
@@ -28,6 +28,82 @@ public final class ExactCpuLedger {
     private ExactReservationReceipt receipt;
     private ReleaseObligation releaseObligation;
     private ReservedPlanLease lease;
+
+    public ExactCpuLedger() {
+        this(UUID.randomUUID());
+    }
+
+    private ExactCpuLedger(UUID ledgerIdentity) {
+        this.ledgerIdentity = Objects.requireNonNull(ledgerIdentity, "ledgerIdentity");
+    }
+
+    /**
+     * Assignment-only reconstruction used by {@link ExactRecoveryActivation}. The checkpoint constructor has already
+     * proved the cross-object state matrix; this method still rebuilds every derived authority from the sealed plan
+     * rather than accepting a raw mutable state injection.
+     */
+    static ExactCpuLedger restoreFromRecovery(ExactCraftingPlan plan, ExactCpuLedgerSnapshot recovered) {
+        Objects.requireNonNull(plan, "plan");
+        Objects.requireNonNull(recovered, "recovered");
+        CpuPlanHandle recoveredHandle = recovered.handle()
+                .orElseThrow(() -> new IllegalArgumentException("Recoverable ledger requires its handle"));
+        if (recovered.lifecycleRevision() != recoveredHandle.revision()) {
+            throw new IllegalArgumentException("Recovery ledger revision differs from its handle");
+        }
+        ExactCpuLedger result = new ExactCpuLedger(recoveredHandle.ledgerIdentity());
+        result.lifecycleRevision = recovered.lifecycleRevision();
+        result.handle = recoveredHandle;
+        result.recoveryPlan = plan;
+        switch (recovered.state()) {
+            case PREPARED -> {
+                requireNoReservation(recovered);
+                result.preparedPlan = plan;
+                result.state = ExactCpuLedgerState.PREPARED;
+            }
+            case RESERVED -> {
+                ReservationId reservation = recovered.reservationId()
+                        .orElseThrow(() -> new IllegalArgumentException("Reserved recovery ledger lacks reservation"));
+                result.receipt = ExactReservationReceipt.forReservedPlan(recoveredHandle, reservation, plan);
+                if (!result.receipt.reservedDebits().equals(recovered.reservedDebits())) {
+                    throw new IllegalArgumentException("Recovery receipt differs from sealed debit");
+                }
+                result.preparedPlan = plan;
+                result.state = ExactCpuLedgerState.RESERVED;
+            }
+            case RELEASE_PENDING -> {
+                ReleaseObligation obligation = recovered.releaseObligation()
+                        .orElseThrow(() -> new IllegalArgumentException("Release recovery ledger lacks obligation"));
+                if (!obligation.handle().equals(recoveredHandle)
+                        || !obligation.reservedDebits().equals(plan.initialStorageDebits())) {
+                    throw new IllegalArgumentException("Recovery release obligation differs from sealed plan");
+                }
+                result.releaseObligation = obligation;
+                result.state = ExactCpuLedgerState.RELEASE_PENDING;
+            }
+            case HANDED_OFF -> {
+                ReservationId reservation = recovered.reservationId()
+                        .orElseThrow(() -> new IllegalArgumentException("Handoff recovery ledger lacks reservation"));
+                UUID leaseIdentity = recovered.leaseIdentity()
+                        .orElseThrow(() -> new IllegalArgumentException("Handoff recovery ledger lacks lease"));
+                result.lease = new ReservedPlanLease(leaseIdentity, recoveredHandle, reservation, plan,
+                        recovered.reservedDebits());
+                result.state = ExactCpuLedgerState.HANDED_OFF;
+            }
+            case IDLE, FAIL_CLOSED -> throw new IllegalArgumentException("Unsafe ledger state cannot be activated");
+        }
+        return result;
+    }
+
+    private static void requireNoReservation(ExactCpuLedgerSnapshot recovered) {
+        if (recovered.reservationId().isPresent() || !recovered.reservedDebits().isEmpty()
+                || recovered.releaseObligation().isPresent() || recovered.leaseIdentity().isPresent()) {
+            throw new IllegalArgumentException("Prepared recovery ledger retains reservation authority");
+        }
+    }
+
+    synchronized ReservedPlanLease recoveryLease() {
+        return lease;
+    }
 
     /** Prepares a validated plan, producing an ABA-safe handle without reserving any resource. */
     public synchronized ExactCpuLedgerResult prepare(ExactCraftingPlan plan) {

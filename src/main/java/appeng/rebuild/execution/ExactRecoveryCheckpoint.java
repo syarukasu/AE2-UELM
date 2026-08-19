@@ -219,6 +219,9 @@ public record ExactRecoveryCheckpoint(ExactCraftingPlan plan, ExactCpuLedgerSnap
                 && broker.workOrderId().orElseThrow().equals(order.workOrderId())
                 && broker.leaseIdentity().orElseThrow().equals(order.leaseIdentity()),
                 "Recovery broker lease identity differs from its work order");
+        require(!(broker.state() == ExactTransferBrokerState.LEASED
+                && order.state() == ExactWorkOrderState.COMPLETED),
+                "A completed work order cannot retain a live handed-off broker/ledger authority");
     }
 
     private static void requireBrokerPlanHandle(ExactCraftingPlan plan, ExactCpuLedgerSnapshot ledger,
