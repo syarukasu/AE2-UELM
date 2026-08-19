@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.pattern.CompiledCandidateSpec;
@@ -28,9 +29,9 @@ import appeng.rebuild.storage.StorageSnapshot;
  * <p>
  * Each demand gets at most two deterministic producer passes. A target producer is first attempted whole and then
  * through a bounded descending-power fallback; a second pass is only entered after the first has committed a target
- * reduction. Productive SCCs are deliberately deferred rather than approximated. Input candidates are tried in bounded
- * cyclic rotations, and later input failure can roll a chunk back to rotate an earlier input group. No operation
- * touches world or legacy state.
+ * reduction. A repeated active producer is considered only as a bounded simple productive ring, then acquired as one
+ * transaction rather than by recursive expansion. Input candidates are tried in bounded cyclic rotations, and later
+ * input failure can roll a chunk back to rotate an earlier input group. No operation touches world or legacy state.
  */
 public final class ExactCraftPlanner {
     public ExactCraftPlanResult plan(ExactCraftRequest request, StorageSnapshot storageSnapshot,
@@ -109,6 +110,10 @@ public final class ExactCraftPlanner {
                 case NEXT_CANDIDATE -> nextCandidate(frame);
                 case WAIT_CHILD -> handleChild(frame);
                 case COMMIT_CHUNK -> commitChunk(frame);
+                case CYCLE_NEXT_EXTERNAL -> nextCycleExternal(frame);
+                case CYCLE_NEXT_CANDIDATE -> nextCycleCandidate(frame);
+                case CYCLE_WAIT_CHILD -> handleCycleChild(frame);
+                case CYCLE_PUBLISH -> publishCycle(frame);
             }
         }
 
@@ -151,6 +156,7 @@ public final class ExactCraftPlanner {
             Producer producer = frame.producers.get(frame.producerIndex++);
             if (!activePatterns.add(producer.id)) {
                 frame.sawCycle = true;
+                beginProductiveCycle(frame, producer);
                 return;
             }
             frame.producer = producer;
@@ -294,7 +300,11 @@ public final class ExactCraftPlanner {
             }
             add(executions, pattern.id(), frame.executions, PatternLimits.MAX_GRAPH_NODES);
             addBatch(frame.batchId, frame.cause, pattern, frame.executions, frame.selections);
+            AEAmount beforeCommit = frame.remaining;
             frame.remaining = consumeProduced(frame.key, frame.remaining);
+            if (frame.remaining.compareTo(beforeCommit) < 0) {
+                frame.rejectedCycles.clear();
+            }
             if (frame.remaining.equals(AEAmount.ZERO)) {
                 activePatterns.remove(pattern.id());
                 frame.producer = null;
@@ -347,6 +357,336 @@ public final class ExactCraftPlanner {
                 }
             }
             return false;
+        }
+
+        /**
+         * Replaces the active suffix ending in {@code duplicate} with one compact productive-cycle transaction. The
+         * cycle is causally owned by the outermost member because that is the only demand edge outside the ring;
+         * retaining the inner normal batches would leave their now-internal input causes dangling.
+         */
+        private void beginProductiveCycle(Frame current, Producer duplicate) {
+            CyclePath path = activeCyclePath(current, duplicate);
+            if (path == null || path.outer.rejectedCycles.contains(path.signature)) {
+                return;
+            }
+            ProductiveCycleSolveResult solved = new ProductiveCycleSolver().solve(path.ring, path.outer.cause);
+            if (solved instanceof ProductiveCycleSolveResult.Failure failure) {
+                if (failure.reason() == ProductiveCycleSolveResult.FailureReason.QUANTITY_LIMIT) {
+                    throw new Abort(ExactCraftPlanResult.FailureReason.QUANTITY_LIMIT);
+                }
+                if (failure.reason() == ProductiveCycleSolveResult.FailureReason.WORK_LIMIT) {
+                    throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
+                }
+                rememberRejectedCycle(path.outer, path.signature);
+                return;
+            }
+
+            ProductiveCycleTemplate template = ((ProductiveCycleSolveResult.Success) solved).template();
+            // Every pending normal member belongs to the proposed ring. Undo all of their direct reads and partial
+            // child plans before reserving the seed, otherwise the same seed could be counted twice.
+            rollback(path.outer.entryCheckpoint);
+            for (Frame member : path.members) {
+                activePatterns.remove(member.producer.id);
+            }
+            while (frames.peek() != path.outer) {
+                frames.pop();
+            }
+
+            PlannedBatchId batchId = reserveBatchId();
+            AEAmount unavailable = consumeAvailable(template.seedKey(), template.seedAmount());
+            if (!unavailable.equals(AEAmount.ZERO)) {
+                rejectCycle(path.outer, path.signature);
+                return;
+            }
+            CycleAttempt attempt = new CycleAttempt(template, batchId, checkpoint(), path.signature);
+            path.outer.resetForCycle(attempt);
+        }
+
+        /** Reconstructs the immediate-parent-to-duplicate ordered simple ring from active WAIT_CHILD frames. */
+        private CyclePath activeCyclePath(Frame current, Producer duplicate) {
+            List<Frame> members = new ArrayList<>();
+            boolean skippedCurrent = false;
+            for (Frame candidate : frames) {
+                if (!skippedCurrent) {
+                    if (candidate != current) {
+                        throw new IllegalStateException("Current planner frame is not the active stack head");
+                    }
+                    skippedCurrent = true;
+                    continue;
+                }
+                if (candidate.producer == null || candidate.phase != Phase.WAIT_CHILD || candidate.allocation == null
+                        || candidate.inputIndex < 0
+                        || candidate.inputIndex >= candidate.producer.pattern.inputs().size()) {
+                    return null;
+                }
+                members.add(candidate);
+                if (candidate.producer.id.equals(duplicate.id)) {
+                    break;
+                }
+            }
+            if (members.isEmpty() || !members.get(members.size() - 1).producer.id.equals(duplicate.id)) {
+                return null;
+            }
+            if (members.size() > PlannerLimits.MAX_PRODUCTIVE_CYCLE_MEMBERS) {
+                throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
+            }
+
+            List<ProductiveCycleRingMember> ringMembers = new ArrayList<>(members.size());
+            List<CycleMemberSignature> signatureMembers = new ArrayList<>(members.size());
+            for (int index = 0; index < members.size(); index++) {
+                Frame member = members.get(index);
+                KeyId suppliedKey = index + 1 == members.size() ? current.key : member.key;
+                int outputIndex = onlyOutputIndex(member.producer.pattern, suppliedKey);
+                if (outputIndex < 0) {
+                    return null;
+                }
+                ringMembers.add(new ProductiveCycleRingMember(member.producer.pattern, member.inputIndex,
+                        member.allocation.candidateIndex(), outputIndex));
+                signatureMembers.add(new CycleMemberSignature(member.producer.id, member.inputIndex,
+                        member.allocation.candidateIndex(), outputIndex));
+            }
+            return new CyclePath(members.get(members.size() - 1), List.copyOf(members),
+                    new ProductiveCycleRing(ringMembers), new CycleSignature(signatureMembers));
+        }
+
+        private int onlyOutputIndex(CompiledPattern pattern, KeyId key) {
+            int result = -1;
+            for (int index = 0; index < pattern.outputs().size(); index++) {
+                if (!pattern.outputs().get(index).key().equals(key)) {
+                    continue;
+                }
+                if (result != -1) {
+                    return -1;
+                }
+                result = index;
+            }
+            return result;
+        }
+
+        private void nextCycleExternal(Frame frame) {
+            CycleAttempt cycle = requireCycle(frame);
+            if (cycle.externalIndex >= cycle.externals.size()) {
+                frame.phase = Phase.CYCLE_PUBLISH;
+                return;
+            }
+            CycleExternal external = cycle.externals.get(cycle.externalIndex);
+            if (cycle.allocation == null) {
+                cycle.allocation = new InputAllocation(external.requirement.input(),
+                        external.requirement.templateUnitsPerTurn(), cycle.candidateStarts[cycle.externalIndex]);
+            }
+            if (cycle.allocation.remaining.equals(AEAmount.ZERO)) {
+                cycle.selections.put(external.identity, cycle.allocation.selections(external.requirement.inputIndex(),
+                        external.pattern));
+                cycle.allocation = null;
+                cycle.externalIndex++;
+                return;
+            }
+            frame.phase = Phase.CYCLE_NEXT_CANDIDATE;
+        }
+
+        private void nextCycleCandidate(Frame frame) {
+            CycleAttempt cycle = requireCycle(frame);
+            CycleExternal external = cycle.externals.get(cycle.externalIndex);
+            InputAllocation allocation = cycle.allocation;
+            if (allocation.remaining.equals(AEAmount.ZERO)) {
+                frame.phase = Phase.CYCLE_NEXT_EXTERNAL;
+                return;
+            }
+            if (allocation.candidatesTried >= allocation.input.candidates().size()) {
+                if (!rotateEarlierCycleExternal(frame)) {
+                    rejectCycle(frame, cycle.signature);
+                }
+                return;
+            }
+            if (!allocation.attemptingCandidate) {
+                allocation.beginCandidate();
+            }
+            AEAmount units = allocation.nextAttemptUnits();
+            if (units == null) {
+                allocation.finishCandidate();
+                return;
+            }
+            decision();
+            CompiledCandidateSpec candidate = allocation.candidate();
+            AEAmount perTurnInitial = allocation.initialRequirement(candidate, units, external.pattern);
+            AEAmount totalInitial = multiply(perTurnInitial, cycle.template.repetitions());
+            frame.candidateCheckpoint = checkpoint();
+            frame.pendingUnits = units;
+            frame.pendingInitial = perTurnInitial;
+            frame.phase = Phase.CYCLE_WAIT_CHILD;
+            frames.push(new Frame(candidate.key(), totalInitial, false, frame.candidateCheckpoint,
+                    new PlannedBatchCause.Input(cycle.batchId, external.requirement.memberIndex(),
+                            external.requirement.inputIndex(), allocation.candidateIndex(), candidate.key(),
+                            totalInitial)));
+        }
+
+        private void handleCycleChild(Frame frame) {
+            CycleAttempt cycle = requireCycle(frame);
+            if (frame.childFailure != null) {
+                rollback(frame.candidateCheckpoint);
+                frame.childFailure = null;
+                cycle.allocation.afterFailedAttempt();
+                frame.phase = Phase.CYCLE_NEXT_CANDIDATE;
+                return;
+            }
+            if (!frame.childSucceeded) {
+                throw new IllegalStateException("Cycle input child did not report an outcome");
+            }
+            frame.childSucceeded = false;
+            cycle.allocation.accept(frame.pendingUnits, frame.pendingInitial);
+            frame.pendingUnits = null;
+            frame.pendingInitial = null;
+            frame.phase = Phase.CYCLE_NEXT_CANDIDATE;
+        }
+
+        private boolean rotateEarlierCycleExternal(Frame frame) {
+            CycleAttempt cycle = requireCycle(frame);
+            for (int index = cycle.externalIndex - 1; index >= 0; index--) {
+                int candidates = cycle.externals.get(index).requirement.input().candidates().size();
+                if (cycle.rotationCounts[index] + 1 < candidates) {
+                    decision();
+                    cycle.candidateStarts[index] = (cycle.candidateStarts[index] + 1) % candidates;
+                    cycle.rotationCounts[index]++;
+                    for (int reset = index + 1; reset < cycle.candidateStarts.length; reset++) {
+                        cycle.candidateStarts[reset] = 0;
+                        cycle.rotationCounts[reset] = 0;
+                    }
+                    rollback(cycle.externalCheckpoint);
+                    cycle.resetExternalAllocations();
+                    frame.phase = Phase.CYCLE_NEXT_EXTERNAL;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void publishCycle(Frame frame) {
+            CycleAttempt cycle = requireCycle(frame);
+            PlannedCycleBatch batch = materializeCycle(cycle);
+            for (PlannedCycleMember member : batch.members()) {
+                add(executions, member.patternId(), multiply(member.executionsPerTurn(), batch.repetitions()),
+                        PatternLimits.MAX_GRAPH_NODES);
+            }
+            addCycleBatch(batch);
+            for (Map.Entry<KeyId, AEAmount> credit : batch.finalCredits().entrySet()) {
+                credit(credit.getKey(), credit.getValue());
+            }
+            frame.remaining = consumeProduced(frame.key, frame.required);
+            if (!frame.remaining.equals(AEAmount.ZERO)) {
+                throw new Abort(ExactCraftPlanResult.FailureReason.INVALID_INPUT);
+            }
+            frame.cycle = null;
+            succeed(frame);
+        }
+
+        private PlannedCycleBatch materializeCycle(CycleAttempt cycle) {
+            List<PlannedCycleMember> members = new ArrayList<>(cycle.template.members().size());
+            for (int memberIndex = 0; memberIndex < cycle.template.members().size(); memberIndex++) {
+                ProductiveCycleTemplate.Member source = cycle.template.members().get(memberIndex);
+                List<PlannedInputSelection> inputs = new ArrayList<>();
+                ProductiveCycleTemplate.InternalLink incoming = cycle.template.internalLinks()
+                        .get((memberIndex - 1 + cycle.template.members().size()) % cycle.template.members().size());
+                CompiledInputSpec internalInput = source.pattern().inputs().get(incoming.inputIndex());
+                CompiledCandidateSpec internalCandidate = internalInput.candidates().get(incoming.candidateIndex());
+                AEAmount internalUnits = multiply(internalInput.multiplier(), source.executionsPerTurn());
+                inputs.add(new PlannedInputSelection(incoming.inputIndex(), incoming.candidateIndex(), internalUnits,
+                        internalCandidate.key(), incoming.consumedAmountPerTurn(), incoming.consumedAmountPerTurn(),
+                        java.util.Optional.empty()));
+                for (ProductiveCycleTemplate.ExternalInputRequirement external : source.externalInputsPerTurn()) {
+                    List<PlannedInputSelection> selections = cycle.selections
+                            .get(new CycleInputIdentity(external.memberIndex(), external.inputIndex()));
+                    if (selections == null) {
+                        throw new Abort(ExactCraftPlanResult.FailureReason.INVALID_INPUT);
+                    }
+                    inputs.addAll(selections);
+                }
+                inputs.sort(Comparator.comparingInt(PlannedInputSelection::inputIndex)
+                        .thenComparingInt(PlannedInputSelection::candidateIndex));
+                List<PlannedCycleOutput> outputs = new ArrayList<>(source.outputsPerTurn().size());
+                for (ProductiveCycleTemplate.Output output : source.outputsPerTurn()) {
+                    outputs.add(new PlannedCycleOutput(output.outputIndex(), output.key(), output.amountPerTurn()));
+                }
+                members.add(new PlannedCycleMember(source.pattern().id(), source.executionsPerTurn(), inputs, outputs));
+            }
+            List<PlannedCycleLink> links = new ArrayList<>(cycle.template.internalLinks().size());
+            for (ProductiveCycleTemplate.InternalLink link : cycle.template.internalLinks()) {
+                links.add(
+                        new PlannedCycleLink(link.producerMemberIndex(), link.outputIndex(), link.consumerMemberIndex(),
+                                link.inputIndex(), link.candidateIndex(), link.key(), link.consumedAmountPerTurn()));
+            }
+            return new PlannedCycleBatch(cycle.batchId, cycle.template.cause(), cycle.template.repetitions(),
+                    cycle.template.seedKey(), cycle.template.seedAmount(), members, links,
+                    cycleFinalCredits(members, links, cycle.template.repetitions(), cycle.template.seedKey(),
+                            cycle.template.seedAmount()));
+        }
+
+        private Map<KeyId, AEAmount> cycleFinalCredits(List<PlannedCycleMember> members, List<PlannedCycleLink> links,
+                AEAmount repetitions, KeyId seedKey, AEAmount seedAmount) {
+            TreeMap<KeyId, AEAmount> perTurn = new TreeMap<>(Comparator.comparingInt(KeyId::value));
+            for (PlannedCycleMember member : members) {
+                for (PlannedCycleOutput output : member.outputsPerTurn()) {
+                    addCredit(perTurn, output.key(), output.amountPerTurn());
+                }
+                for (PlannedInputSelection input : member.inputsPerTurn()) {
+                    input.remainderReturn()
+                            .ifPresent(remainder -> addCredit(perTurn, remainder.key(), remainder.amount()));
+                }
+            }
+            for (PlannedCycleLink link : links) {
+                AEAmount amount = perTurn.getOrDefault(link.key(), AEAmount.ZERO);
+                if (amount.compareTo(link.amountPerTurn()) < 0) {
+                    throw new Abort(ExactCraftPlanResult.FailureReason.INVALID_INPUT);
+                }
+                AEAmount result = subtractAmounts(amount, link.amountPerTurn());
+                if (result.equals(AEAmount.ZERO)) {
+                    perTurn.remove(link.key());
+                } else {
+                    perTurn.put(link.key(), result);
+                }
+            }
+            TreeMap<KeyId, AEAmount> finalCredits = new TreeMap<>(Comparator.comparingInt(KeyId::value));
+            for (Map.Entry<KeyId, AEAmount> entry : perTurn.entrySet()) {
+                finalCredits.put(entry.getKey(), multiply(entry.getValue(), repetitions));
+            }
+            finalCredits.merge(seedKey, seedAmount, this::addAmounts);
+            return finalCredits;
+        }
+
+        private void addCredit(Map<KeyId, AEAmount> credits, KeyId key, AEAmount amount) {
+            if (credits.size() >= PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS && !credits.containsKey(key)) {
+                throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
+            }
+            credits.put(key, addAmounts(credits.getOrDefault(key, AEAmount.ZERO), amount));
+        }
+
+        private void addCycleBatch(PlannedCycleBatch batch) {
+            if (causalSteps.size() >= PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
+                throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
+            }
+            mutation();
+            causalSteps.add(batch);
+            undo.add(new ListUndo<>(causalSteps));
+        }
+
+        private CycleAttempt requireCycle(Frame frame) {
+            if (frame.cycle == null) {
+                throw new IllegalStateException("Cycle planner phase without a cycle attempt");
+            }
+            return frame.cycle;
+        }
+
+        private void rejectCycle(Frame outer, CycleSignature signature) {
+            rollback(outer.entryCheckpoint);
+            rememberRejectedCycle(outer, signature);
+            outer.resetForRestart();
+        }
+
+        private void rememberRejectedCycle(Frame frame, CycleSignature signature) {
+            if (!frame.rejectedCycles.contains(signature)
+                    && frame.rejectedCycles.size() >= PlannerLimits.MAX_PRODUCTIVE_CYCLE_ATTEMPTS) {
+                throw new Abort(ExactCraftPlanResult.FailureReason.WORK_LIMIT);
+            }
+            frame.rejectedCycles.add(signature);
         }
 
         private void credit(KeyId key, AEAmount amount) {
@@ -746,7 +1086,76 @@ public final class ExactCraftPlanner {
     }
 
     private enum Phase {
-        START, NEXT_PRODUCER, START_CHUNK, NEXT_INPUT, NEXT_CANDIDATE, WAIT_CHILD, COMMIT_CHUNK
+        START, NEXT_PRODUCER, START_CHUNK, NEXT_INPUT, NEXT_CANDIDATE, WAIT_CHILD, COMMIT_CHUNK,
+        CYCLE_NEXT_EXTERNAL, CYCLE_NEXT_CANDIDATE, CYCLE_WAIT_CHILD, CYCLE_PUBLISH
+    }
+
+    /** Exact structural identity for one bounded rejected active ring. */
+    private record CycleSignature(List<CycleMemberSignature> members) {
+        private CycleSignature {
+            members = List.copyOf(members);
+        }
+    }
+
+    private record CycleMemberSignature(PatternId patternId, int internalInputIndex, int internalCandidateIndex,
+            int supplyingOutputIndex) {
+        private CycleMemberSignature {
+            Objects.requireNonNull(patternId, "patternId");
+        }
+    }
+
+    private record CycleInputIdentity(int memberIndex, int inputIndex) {
+    }
+
+    private record CyclePath(Frame outer, List<Frame> members, ProductiveCycleRing ring, CycleSignature signature) {
+    }
+
+    private static final class CycleExternal {
+        private final ProductiveCycleTemplate.ExternalInputRequirement requirement;
+        private final CompiledPattern pattern;
+        private final CycleInputIdentity identity;
+
+        private CycleExternal(ProductiveCycleTemplate.ExternalInputRequirement requirement, CompiledPattern pattern) {
+            this.requirement = requirement;
+            this.pattern = pattern;
+            this.identity = new CycleInputIdentity(requirement.memberIndex(), requirement.inputIndex());
+        }
+    }
+
+    private static final class CycleAttempt {
+        private final ProductiveCycleTemplate template;
+        private final PlannedBatchId batchId;
+        private final int externalCheckpoint;
+        private final CycleSignature signature;
+        private final List<CycleExternal> externals;
+        private final int[] candidateStarts;
+        private final int[] rotationCounts;
+        private final Map<CycleInputIdentity, List<PlannedInputSelection>> selections = new HashMap<>();
+        private int externalIndex;
+        private Search.InputAllocation allocation;
+
+        private CycleAttempt(ProductiveCycleTemplate template, PlannedBatchId batchId, int externalCheckpoint,
+                CycleSignature signature) {
+            this.template = template;
+            this.batchId = batchId;
+            this.externalCheckpoint = externalCheckpoint;
+            this.signature = signature;
+            List<CycleExternal> flattened = new ArrayList<>();
+            for (ProductiveCycleTemplate.Member member : template.members()) {
+                for (ProductiveCycleTemplate.ExternalInputRequirement input : member.externalInputsPerTurn()) {
+                    flattened.add(new CycleExternal(input, member.pattern()));
+                }
+            }
+            this.externals = List.copyOf(flattened);
+            this.candidateStarts = new int[externals.size()];
+            this.rotationCounts = new int[externals.size()];
+        }
+
+        private void resetExternalAllocations() {
+            externalIndex = 0;
+            allocation = null;
+            selections.clear();
+        }
     }
 
     private static final class Frame {
@@ -783,6 +1192,8 @@ public final class ExactCraftPlanner {
         private boolean sawUnsatisfiable;
         private final PlannedBatchCause cause;
         private PlannedBatchId batchId;
+        private CycleAttempt cycle;
+        private final Set<CycleSignature> rejectedCycles = new HashSet<>();
 
         private Frame(KeyId key, AEAmount required, boolean root, int entryCheckpoint, PlannedBatchCause cause) {
             this.key = key;
@@ -790,6 +1201,44 @@ public final class ExactCraftPlanner {
             this.root = root;
             this.entryCheckpoint = entryCheckpoint;
             this.cause = cause;
+        }
+
+        private void resetForCycle(CycleAttempt cycle) {
+            resetForRestart();
+            this.cycle = Objects.requireNonNull(cycle, "cycle");
+            this.phase = Phase.CYCLE_NEXT_EXTERNAL;
+        }
+
+        private void resetForRestart() {
+            phase = Phase.START;
+            remaining = null;
+            producers = List.of();
+            producerIndex = 0;
+            producerPasses = 0;
+            passStartRemaining = null;
+            producer = null;
+            outputPerExecution = null;
+            wholeAttempt = null;
+            chunkSchedule = List.of();
+            chunkIndex = 0;
+            chunkCheckpoint = 0;
+            retryChunk = false;
+            retryingExistingChunk = false;
+            candidateStarts = new int[0];
+            rotationCounts = new int[0];
+            executions = null;
+            inputIndex = 0;
+            allocation = null;
+            selections = null;
+            candidateCheckpoint = 0;
+            pendingUnits = null;
+            pendingInitial = null;
+            childSucceeded = false;
+            childFailure = null;
+            sawCycle = false;
+            sawUnsatisfiable = false;
+            batchId = null;
+            cycle = null;
         }
     }
 
