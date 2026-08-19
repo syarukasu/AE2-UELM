@@ -1,5 +1,6 @@
 package appeng.rebuild.execution;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -7,6 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 import appeng.api.networking.security.IActionSource;
 import appeng.rebuild.key.KeyId;
@@ -31,6 +33,8 @@ import appeng.rebuild.storage.BrokerExactStorage;
 public final class ExactWorkOrder {
     private static final Comparator<KeyId> KEY_ORDER = Comparator.comparingInt(KeyId::value);
     private static final AEAmount LONG_MAX_AMOUNT = AEAmount.of(Long.MAX_VALUE);
+    private static final BigInteger MAX_BOUNDED_AMOUNT = BigInteger.ONE.shiftLeft(PlannerLimits.MAX_CRAFT_QUANTITY_BITS)
+            .subtract(BigInteger.ONE);
 
     private final WorkOrderId workOrderId;
     private final ReservedPlanLease lease;
@@ -41,7 +45,7 @@ public final class ExactWorkOrder {
     private final List<ExecutionManifest> manifests;
 
     /** Only non-zero exact quantities are retained. It is never exposed without a defensive immutable copy. */
-    private final TreeMap<KeyId, AEAmount> custody = new TreeMap<>(KEY_ORDER);
+    private TreeMap<KeyId, AEAmount> custody = new TreeMap<>(KEY_ORDER);
     private ExactWorkOrderState state = ExactWorkOrderState.READY;
     private int causalStepIndex;
     private AEAmount remainingExecutions = AEAmount.ZERO;
@@ -49,6 +53,8 @@ public final class ExactWorkOrder {
     private IssuedCommand outstanding;
     private IssuedCommand inFlight;
     private ExactWorkDiscrepancy discrepancy;
+    private ExactCompletedCommandEvidence completedEvidence;
+    private boolean completedEvidenceProgressApplied;
     private long nextGeneration;
     private boolean generationExhausted;
     private boolean entered;
@@ -102,6 +108,7 @@ public final class ExactWorkOrder {
                 return new ExactWorkOrderCommandResult.CycleUnsupported(snapshot());
             }
             if (generationExhausted) {
+                state = ExactWorkOrderState.FAIL_CLOSED;
                 return unavailable(ExactWorkOrderCommandResult.Reason.COMMAND_GENERATION_EXHAUSTED);
             }
             if (remainingExecutions.equals(AEAmount.ZERO) || selectionRemaining.size() != normal.execution()
@@ -147,10 +154,11 @@ public final class ExactWorkOrder {
             if (acceptance == null || outstanding == null || !outstanding.command().equals(acceptance.command())) {
                 return transitionFailure(ExactWorkOrderTransitionResult.Reason.IDENTITY_MISMATCH);
             }
-            if (!canSubtract(custody, outstanding.command().custodyInputs())) {
+            TreeMap<KeyId, AEAmount> transferred = subtractCopy(custody, outstanding.command().custodyInputs());
+            if (transferred == null || projectedCustody(outstanding.command()) == null) {
                 return failTransitionInvariant();
             }
-            subtract(custody, outstanding.command().custodyInputs());
+            custody = transferred;
             inFlight = outstanding;
             outstanding = null;
             state = ExactWorkOrderState.IN_FLIGHT;
@@ -202,31 +210,64 @@ public final class ExactWorkOrder {
             IssuedCommand completed = inFlight;
             // The executor has already physically produced these reported goods. Retain them before evaluating a
             // mismatch so fail-closed accounting cannot silently discard physical custody.
-            add(custody, completion.actualOutputs());
-            add(custody, completion.actualRemainders());
-            inFlight = null;
-            if (!completed.command().expectedOutputs().equals(completion.actualOutputs())
-                    || !completed.command().expectedRemainders().equals(completion.actualRemainders())) {
-                discrepancy = new ExactWorkDiscrepancy(completed.command(), completed.command().expectedOutputs(),
-                        completion.actualOutputs(), completed.command().expectedRemainders(),
-                        completion.actualRemainders());
+            boolean mismatch = !completed.command().expectedOutputs().equals(completion.actualOutputs())
+                    || !completed.command().expectedRemainders().equals(completion.actualRemainders());
+            ExactWorkDiscrepancy observed = mismatch
+                    ? new ExactWorkDiscrepancy(completed.command(), completed.command().expectedOutputs(),
+                            completion.actualOutputs(), completed.command().expectedRemainders(),
+                            completion.actualRemainders())
+                    : null;
+            final ProgressState nextProgress;
+            final int nextCausalStep;
+            try {
+                ProgressState calculated = completed.progress().apply(remainingExecutions, selectionRemaining);
+                int calculatedStep = calculated.remainingExecutions().equals(AEAmount.ZERO) ? causalStepIndex + 1
+                        : causalStepIndex;
+                nextProgress = calculatedStep == causalStepIndex ? calculated : progressAt(calculatedStep);
+                nextCausalStep = calculatedStep;
+            } catch (RuntimeException invalidProgress) {
+                if (observed != null) {
+                    return closeWithUnmergedDiscrepancy(observed);
+                }
+                return closeWithCompletedEvidence(exactCompletedEvidence(completed, completion), false);
+            }
+            final TreeMap<KeyId, AEAmount> credited;
+            try {
+                credited = creditCopy(custody, completion.actualOutputs(), completion.actualRemainders());
+            } catch (RuntimeException boundedCustodyFailure) {
+                if (observed != null) {
+                    return closeWithUnmergedDiscrepancy(observed);
+                }
+                return closeWithCompletedEvidence(exactCompletedEvidence(completed, completion), true, nextProgress,
+                        nextCausalStep);
+            }
+            if (mismatch) {
+                custody = credited;
+                inFlight = null;
+                discrepancy = observed;
                 state = ExactWorkOrderState.FAIL_CLOSED;
                 return transitionFailure(ExactWorkOrderTransitionResult.Reason.RESULT_MISMATCH);
             }
-            completed.progress().commit(this);
-            if (remainingExecutions.equals(AEAmount.ZERO)) {
-                causalStepIndex++;
-                loadCurrentNormalProgress();
-            }
-            if (causalStepIndex >= manifests.size()) {
-                if (!custody.equals(expectedTerminalCustody())) {
-                    return failTransitionInvariant();
+            try {
+                ExactCompletedCommandEvidence evidence = exactCompletedEvidence(completed, completion);
+                ExactWorkOrderState nextState = ExactWorkOrderState.READY;
+                if (nextCausalStep >= manifests.size()) {
+                    if (!credited.equals(expectedTerminalCustody())) {
+                        return closeWithCompletedEvidence(credited, evidence, nextProgress, nextCausalStep);
+                    }
+                    nextState = ExactWorkOrderState.SETTLEMENT_PENDING;
                 }
-                state = ExactWorkOrderState.SETTLEMENT_PENDING;
-            } else {
-                state = ExactWorkOrderState.READY;
+                custody = credited;
+                inFlight = null;
+                remainingExecutions = nextProgress.remainingExecutions();
+                selectionRemaining = nextProgress.selectionRemaining();
+                causalStepIndex = nextCausalStep;
+                state = nextState;
+                return new ExactWorkOrderTransitionResult.Completed(snapshot());
+            } catch (RuntimeException invariant) {
+                return closeWithCompletedEvidence(credited, exactCompletedEvidence(completed, completion), nextProgress,
+                        nextCausalStep);
             }
-            return new ExactWorkOrderTransitionResult.Completed(snapshot());
         } catch (RuntimeException failure) {
             return failTransitionInvariant();
         } finally {
@@ -238,19 +279,21 @@ public final class ExactWorkOrder {
     public synchronized ExactWorkOrderSnapshot snapshot() {
         return new ExactWorkOrderSnapshot(state, lease.planId(), lease.handle(), lease.reservationId(),
                 lease.leaseIdentity(), workOrderId, custody, causalStepIndex, remainingExecutions, selectionRemaining,
+                nextGeneration, generationExhausted,
                 Optional.ofNullable(outstanding).map(IssuedCommand::command), Optional.ofNullable(inFlight)
                         .map(IssuedCommand::command),
-                Optional.ofNullable(discrepancy));
+                Optional.ofNullable(discrepancy), Optional.ofNullable(completedEvidence),
+                completedEvidenceProgressApplied);
     }
 
     private ExactWorkOrderCommandResult.Unavailable beginIssue() {
         if (entered) {
-            return unavailable(ExactWorkOrderCommandResult.Reason.INVARIANT_VIOLATION);
+            return unavailable(ExactWorkOrderCommandResult.Reason.REENTRANT);
         }
         entered = true;
         if (!onServerThread()) {
             ExactWorkOrderCommandResult.Unavailable failure = unavailable(
-                    ExactWorkOrderCommandResult.Reason.WRONG_STATE);
+                    ExactWorkOrderCommandResult.Reason.WRONG_THREAD);
             entered = false;
             return failure;
         }
@@ -310,24 +353,82 @@ public final class ExactWorkOrder {
         return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
     }
 
+    /** A command completed physically, so retain its staged goods and exact completion evidence before closing. */
+    private ExactWorkOrderTransitionResult.Failure closeWithCompletedEvidence(TreeMap<KeyId, AEAmount> credited,
+            ExactCompletedCommandEvidence evidence, ProgressState progress, int nextCausalStep) {
+        custody = credited;
+        inFlight = null;
+        completedEvidence = evidence;
+        completedEvidenceProgressApplied = true;
+        remainingExecutions = progress.remainingExecutions();
+        selectionRemaining = progress.selectionRemaining();
+        causalStepIndex = nextCausalStep;
+        state = ExactWorkOrderState.FAIL_CLOSED;
+        return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
+    }
+
+    /** Retains executor evidence as the recovery authority when bounded exact custody cannot aggregate it. */
+    private ExactWorkOrderTransitionResult.Failure closeWithUnmergedDiscrepancy(ExactWorkDiscrepancy observed) {
+        inFlight = null;
+        discrepancy = observed;
+        state = ExactWorkOrderState.FAIL_CLOSED;
+        return transitionFailure(ExactWorkOrderTransitionResult.Reason.RESULT_MISMATCH);
+    }
+
+    private ExactWorkOrderTransitionResult.Failure closeWithCompletedEvidence(ExactCompletedCommandEvidence evidence,
+            boolean progressApplied) {
+        inFlight = null;
+        completedEvidence = evidence;
+        completedEvidenceProgressApplied = progressApplied;
+        state = ExactWorkOrderState.FAIL_CLOSED;
+        return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
+    }
+
+    private ExactWorkOrderTransitionResult.Failure closeWithCompletedEvidence(ExactCompletedCommandEvidence evidence,
+            boolean progressApplied, ProgressState progress, int nextCausalStep) {
+        if (!progressApplied) {
+            return closeWithCompletedEvidence(evidence, false);
+        }
+        inFlight = null;
+        completedEvidence = evidence;
+        completedEvidenceProgressApplied = true;
+        remainingExecutions = progress.remainingExecutions();
+        selectionRemaining = progress.selectionRemaining();
+        causalStepIndex = nextCausalStep;
+        state = ExactWorkOrderState.FAIL_CLOSED;
+        return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
+    }
+
+    private ExactCompletedCommandEvidence exactCompletedEvidence(IssuedCommand completed,
+            WorkCommandCompletion completion) {
+        return new ExactCompletedCommandEvidence(completed.command(), completion.actualOutputs(),
+                completion.actualRemainders());
+    }
+
     private void loadCurrentNormalProgress() {
         if (causalStepIndex >= manifests.size()) {
             remainingExecutions = AEAmount.ZERO;
             selectionRemaining = List.of();
             return;
         }
-        ExecutionManifest manifest = manifests.get(causalStepIndex);
+        ProgressState progress = progressAt(causalStepIndex);
+        remainingExecutions = progress.remainingExecutions();
+        selectionRemaining = progress.selectionRemaining();
+    }
+
+    private ProgressState progressAt(int index) {
+        if (index >= manifests.size()) {
+            return new ProgressState(AEAmount.ZERO, List.of());
+        }
+        ExecutionManifest manifest = manifests.get(index);
         if (manifest instanceof NormalExecutionManifest normal) {
-            remainingExecutions = normal.execution().executions();
             ArrayList<AEAmount> remaining = new ArrayList<>(normal.execution().plannedSelections().size());
             for (PlannedInputSelection selection : normal.execution().plannedSelections()) {
                 remaining.add(selection.templateUnits());
             }
-            selectionRemaining = List.copyOf(remaining);
-        } else {
-            remainingExecutions = AEAmount.ZERO;
-            selectionRemaining = List.of();
+            return new ProgressState(normal.execution().executions(), List.copyOf(remaining));
         }
+        return new ProgressState(AEAmount.ZERO, List.of());
     }
 
     private long maximumWindow(long requestedWindow, SealedPatternExecution execution) {
@@ -340,29 +441,188 @@ public final class ExactWorkOrder {
         return maximum;
     }
 
-    /** Bounded monotonic feasibility search over at most the 63 bits of a signed physical window. */
+    /**
+     * Finds the largest feasible physical window without assuming feasibility is globally monotonic. Candidate
+     * exhaustion points partition the window into bounded pieces where every command amount and projected custody is
+     * affine. Each piece is solved algebraically after a bounded physical-prefix binary search.
+     */
     private ExactWorkCommand largestPhysicalCommand(NormalExecutionManifest normal, long maximumWindow) {
-        ExactWorkCommand best = tryBuildCommand(normal, maximumWindow);
-        if (best != null) {
-            return best;
+        TreeSet<Long> starts = structuralStarts(normal.execution(), maximumWindow);
+        starts.add(1L);
+        ExactWorkCommand best = null;
+        long lower = 1L;
+        for (Long next : starts.tailSet(2L, true)) {
+            long upper = next - 1L;
+            if (lower <= upper) {
+                ExactWorkCommand candidate = largestInStructuralPiece(normal, lower, upper);
+                if (candidate != null && (best == null || candidate.executionWindow() > best.executionWindow())) {
+                    best = candidate;
+                }
+            }
+            lower = next;
         }
-        long low = 1L;
-        long high = maximumWindow - 1L;
-        while (low <= high) {
-            long middle = low + ((high - low) >>> 1);
-            ExactWorkCommand candidate = tryBuildCommand(normal, middle);
-            if (candidate != null) {
+        if (lower <= maximumWindow) {
+            ExactWorkCommand candidate = largestInStructuralPiece(normal, lower, maximumWindow);
+            if (candidate != null && (best == null || candidate.executionWindow() > best.executionWindow())) {
                 best = candidate;
-                low = middle + 1L;
-            } else {
-                high = middle - 1L;
             }
         }
         return best;
     }
 
+    private TreeSet<Long> structuralStarts(SealedPatternExecution execution, long maximumWindow) {
+        TreeSet<Long> starts = new TreeSet<>();
+        for (int inputIndex = 0; inputIndex < execution.pattern().inputs().size(); inputIndex++) {
+            AEAmount cumulative = AEAmount.ZERO;
+            AEAmount multiplier = execution.pattern().inputs().get(inputIndex).multiplier();
+            for (int selectionIndex = 0; selectionIndex < execution.plannedSelections().size(); selectionIndex++) {
+                PlannedInputSelection selection = execution.plannedSelections().get(selectionIndex);
+                if (selection.inputIndex() != inputIndex) {
+                    continue;
+                }
+                cumulative = cumulative.add(selectionRemaining.get(selectionIndex));
+                // The next candidate starts at the first integral window whose required units exceed this completed
+                // candidate's cumulative capacity. ceil(cumulative / multiplier) is one window too early when the
+                // capacity divides exactly.
+                AEAmount boundary = cumulative.divide(multiplier).add(AEAmount.ONE);
+                if (boundary.compareTo(AEAmount.ONE) > 0 && boundary.compareTo(AEAmount.of(maximumWindow)) <= 0) {
+                    starts.add(boundary.longValueExact());
+                }
+            }
+        }
+        return starts;
+    }
+
+    private ExactWorkCommand largestInStructuralPiece(NormalExecutionManifest normal, long lower, long upper) {
+        ExactWorkCommand first = buildPhysicalCommand(normal, lower);
+        if (first == null) {
+            return null;
+        }
+        long physicalUpper = upper;
+        if (buildPhysicalCommand(normal, upper) == null) {
+            long low = lower;
+            long high = upper - 1L;
+            while (low <= high) {
+                long middle = low + ((high - low) >>> 1);
+                if (buildPhysicalCommand(normal, middle) == null) {
+                    high = middle - 1L;
+                } else {
+                    physicalUpper = middle;
+                    low = middle + 1L;
+                }
+            }
+        }
+        ExactWorkCommand last = buildPhysicalCommand(normal, physicalUpper);
+        long feasible = largestProjectedWindow(first, last, lower, physicalUpper);
+        return feasible < lower ? null : tryBuildCommand(normal, feasible);
+    }
+
+    private long largestProjectedWindow(ExactWorkCommand first, ExactWorkCommand last, long lower, long upper) {
+        Map<KeyId, BigInteger> firstProjection = unboundedProjection(first);
+        Map<KeyId, BigInteger> lastProjection = unboundedProjection(last);
+        TreeSet<KeyId> keys = new TreeSet<>(KEY_ORDER);
+        keys.addAll(firstProjection.keySet());
+        keys.addAll(lastProjection.keySet());
+        long[] offsets = { 0L, upper - lower };
+        BigInteger width = BigInteger.valueOf(offsets[1]);
+        for (KeyId key : keys) {
+            BigInteger base = firstProjection.getOrDefault(key, BigInteger.ZERO);
+            BigInteger end = lastProjection.getOrDefault(key, BigInteger.ZERO);
+            BigInteger slope = affineSlope(base, end, width);
+            if (slope == null || !constrainAffine(offsets, base, slope, MAX_BOUNDED_AMOUNT)) {
+                return -1L;
+            }
+        }
+        Map<KeyId, AEAmount> firstInputs = first.custodyInputs();
+        Map<KeyId, AEAmount> lastInputs = last.custodyInputs();
+        keys.clear();
+        keys.addAll(firstInputs.keySet());
+        keys.addAll(lastInputs.keySet());
+        for (KeyId key : keys) {
+            BigInteger base = firstInputs.getOrDefault(key, AEAmount.ZERO).toBigInteger();
+            BigInteger end = lastInputs.getOrDefault(key, AEAmount.ZERO).toBigInteger();
+            BigInteger slope = affineSlope(base, end, width);
+            BigInteger available = custody.getOrDefault(key, AEAmount.ZERO).toBigInteger();
+            if (slope == null || !constrainAffine(offsets, base, slope, available)) {
+                return -1L;
+            }
+        }
+        return lower + offsets[1];
+    }
+
+    private static BigInteger affineSlope(BigInteger base, BigInteger end, BigInteger width) {
+        BigInteger delta = end.subtract(base);
+        if (width.signum() == 0) {
+            return delta.signum() == 0 ? BigInteger.ZERO : null;
+        }
+        BigInteger[] division = delta.divideAndRemainder(width);
+        return division[1].signum() == 0 ? division[0] : null;
+    }
+
+    /** Intersects the inclusive offset range with {@code 0 <= base + slope * offset <= maximum}. */
+    private static boolean constrainAffine(long[] offsets, BigInteger base, BigInteger slope, BigInteger maximum) {
+        if (maximum.signum() < 0) {
+            return false;
+        }
+        if (slope.signum() > 0) {
+            offsets[0] = Math.max(offsets[0], ceilDivClamped(base.negate(), slope));
+            offsets[1] = Math.min(offsets[1], floorDivClamped(maximum.subtract(base), slope));
+        } else if (slope.signum() < 0) {
+            BigInteger positive = slope.negate();
+            offsets[0] = Math.max(offsets[0], ceilDivClamped(base.subtract(maximum), positive));
+            offsets[1] = Math.min(offsets[1], floorDivClamped(base, positive));
+        } else if (base.signum() < 0 || base.compareTo(maximum) > 0) {
+            return false;
+        }
+        return offsets[0] <= offsets[1];
+    }
+
+    private Map<KeyId, BigInteger> unboundedProjection(ExactWorkCommand command) {
+        TreeMap<KeyId, BigInteger> projection = new TreeMap<>(KEY_ORDER);
+        custody.forEach((key, amount) -> projection.put(key, amount.toBigInteger()));
+        applySigned(projection, command.custodyInputs(), -1);
+        applySigned(projection, command.expectedOutputs(), 1);
+        applySigned(projection, command.expectedRemainders(), 1);
+        projection.entrySet().removeIf(entry -> entry.getValue().signum() == 0);
+        return Map.copyOf(projection);
+    }
+
+    private static void applySigned(TreeMap<KeyId, BigInteger> target, Map<KeyId, AEAmount> amounts, int sign) {
+        for (Map.Entry<KeyId, AEAmount> entry : amounts.entrySet()) {
+            target.merge(entry.getKey(), entry.getValue().toBigInteger().multiply(BigInteger.valueOf(sign)),
+                    BigInteger::add);
+        }
+    }
+
+    private static long floorDivClamped(BigInteger dividend, BigInteger divisor) {
+        BigInteger[] result = dividend.divideAndRemainder(divisor);
+        BigInteger quotient = result[1].signum() < 0 ? result[0].subtract(BigInteger.ONE) : result[0];
+        return clampToLong(quotient);
+    }
+
+    private static long ceilDivClamped(BigInteger dividend, BigInteger divisor) {
+        BigInteger[] result = dividend.divideAndRemainder(divisor);
+        BigInteger quotient = result[1].signum() > 0 ? result[0].add(BigInteger.ONE) : result[0];
+        return clampToLong(quotient);
+    }
+
+    private static long clampToLong(BigInteger value) {
+        if (value.compareTo(BigInteger.valueOf(Long.MIN_VALUE)) < 0) {
+            return Long.MIN_VALUE;
+        }
+        if (value.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0) {
+            return Long.MAX_VALUE;
+        }
+        return value.longValue();
+    }
+
     /** Pure command construction: it neither advances cursors nor changes custody. */
     private ExactWorkCommand tryBuildCommand(NormalExecutionManifest normal, long window) {
+        ExactWorkCommand command = buildPhysicalCommand(normal, window);
+        return command != null && projectedCustody(command) != null ? command : null;
+    }
+
+    private ExactWorkCommand buildPhysicalCommand(NormalExecutionManifest normal, long window) {
         try {
             SealedPatternExecution execution = normal.execution();
             CompiledPattern pattern = execution.pattern();
@@ -372,10 +632,13 @@ public final class ExactWorkOrder {
             List<ExactWorkOutput> outputSlots = outputsForWindow(pattern, window);
             Map<KeyId, AEAmount> outputs = aggregateOutputs(outputSlots);
             Map<KeyId, AEAmount> remainders = aggregateRemainders(selections);
-            return new ExactWorkCommand(new WorkCommandId(lease.planId(), lease.leaseIdentity(), workOrderId,
-                    nextGeneration), lease.handle(), lease.reservationId(), normal.batchId(), pattern, window,
+            ExactWorkCommand command = new ExactWorkCommand(
+                    new WorkCommandId(lease.planId(), lease.leaseIdentity(), workOrderId,
+                            nextGeneration),
+                    lease.handle(), lease.reservationId(), normal.batchId(), pattern, window,
                     selections,
                     inputs, outputSlots, outputs, remainders);
+            return command;
         } catch (IllegalArgumentException | ArithmeticException invalidPhysicalWindow) {
             return null;
         }
@@ -462,24 +725,46 @@ public final class ExactWorkOrder {
         return Map.copyOf(expected);
     }
 
-    private static boolean canSubtract(Map<KeyId, AEAmount> source, Map<KeyId, AEAmount> debits) {
-        for (Map.Entry<KeyId, AEAmount> debit : debits.entrySet()) {
-            if (source.getOrDefault(debit.getKey(), AEAmount.ZERO).compareTo(debit.getValue()) < 0) {
-                return false;
-            }
+    /** Pure post-completion custody preflight used before issue and rechecked before physical acceptance. */
+    private TreeMap<KeyId, AEAmount> projectedCustody(ExactWorkCommand command) {
+        TreeMap<KeyId, AEAmount> projected = subtractCopy(custody, command.custodyInputs());
+        if (projected == null) {
+            return null;
         }
-        return true;
+        try {
+            add(projected, command.expectedOutputs());
+            add(projected, command.expectedRemainders());
+            return projected;
+        } catch (RuntimeException bounded) {
+            return null;
+        }
     }
 
-    private static void subtract(TreeMap<KeyId, AEAmount> source, Map<KeyId, AEAmount> debits) {
+    private static TreeMap<KeyId, AEAmount> subtractCopy(Map<KeyId, AEAmount> source, Map<KeyId, AEAmount> debits) {
+        TreeMap<KeyId, AEAmount> copy = new TreeMap<>(KEY_ORDER);
+        copy.putAll(source);
         for (Map.Entry<KeyId, AEAmount> debit : debits.entrySet()) {
-            AEAmount remaining = source.get(debit.getKey()).subtractExact(debit.getValue());
+            AEAmount current = copy.getOrDefault(debit.getKey(), AEAmount.ZERO);
+            if (current.compareTo(debit.getValue()) < 0) {
+                return null;
+            }
+            AEAmount remaining = current.subtractExact(debit.getValue());
             if (remaining.equals(AEAmount.ZERO)) {
-                source.remove(debit.getKey());
+                copy.remove(debit.getKey());
             } else {
-                source.put(debit.getKey(), remaining);
+                copy.put(debit.getKey(), remaining);
             }
         }
+        return copy;
+    }
+
+    private static TreeMap<KeyId, AEAmount> creditCopy(Map<KeyId, AEAmount> source,
+            Map<KeyId, AEAmount> outputs, Map<KeyId, AEAmount> remainders) {
+        TreeMap<KeyId, AEAmount> copy = new TreeMap<>(KEY_ORDER);
+        copy.putAll(source);
+        add(copy, outputs);
+        add(copy, remainders);
+        return copy;
     }
 
     private static void add(TreeMap<KeyId, AEAmount> source, Map<KeyId, AEAmount> credits) {
@@ -492,7 +777,11 @@ public final class ExactWorkOrder {
     }
 
     private static void merge(TreeMap<KeyId, AEAmount> target, KeyId key, AEAmount amount) {
-        target.merge(key, amount, AEAmount::add);
+        AEAmount merged = target.getOrDefault(key, AEAmount.ZERO).add(amount);
+        if (merged.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS) {
+            throw new IllegalArgumentException("Exact custody quantity exceeds its bounded bit limit");
+        }
+        target.put(key, merged);
     }
 
     /** Immutable per-command cursor movement committed only after a matching completion. */
@@ -525,29 +814,35 @@ public final class ExactWorkOrder {
             return new ProgressDelta(delta, AEAmount.of(executionWindow));
         }
 
-        private void commit(ExactWorkOrder order) {
-            if (selectionUnits.size() != order.selectionRemaining.size()
-                    || order.remainingExecutions.compareTo(executions) < 0) {
+        private ProgressState apply(AEAmount remainingExecutions, List<AEAmount> selectionRemaining) {
+            if (selectionUnits.size() != selectionRemaining.size() || remainingExecutions.compareTo(executions) < 0) {
                 throw new IllegalStateException("Progress delta is not valid for this work order");
             }
             ArrayList<AEAmount> next = new ArrayList<>(selectionUnits.size());
             for (int index = 0; index < selectionUnits.size(); index++) {
                 AEAmount used = selectionUnits.get(index);
-                AEAmount available = order.selectionRemaining.get(index);
+                AEAmount available = selectionRemaining.get(index);
                 if (available.compareTo(used) < 0) {
                     throw new IllegalStateException("Progress would underflow a sealed selection cursor");
                 }
                 next.add(available.subtractExact(used));
             }
-            order.remainingExecutions = order.remainingExecutions.subtractExact(executions);
-            if (order.remainingExecutions.equals(AEAmount.ZERO)) {
+            AEAmount nextExecutions = remainingExecutions.subtractExact(executions);
+            if (nextExecutions.equals(AEAmount.ZERO)) {
                 for (AEAmount amount : next) {
                     if (!amount.equals(AEAmount.ZERO)) {
                         throw new IllegalStateException("Completed normal batch retained an input cursor");
                     }
                 }
             }
-            order.selectionRemaining = List.copyOf(next);
+            return new ProgressState(nextExecutions, List.copyOf(next));
+        }
+    }
+
+    private record ProgressState(AEAmount remainingExecutions, List<AEAmount> selectionRemaining) {
+        private ProgressState {
+            Objects.requireNonNull(remainingExecutions, "remainingExecutions");
+            selectionRemaining = List.copyOf(Objects.requireNonNull(selectionRemaining, "selectionRemaining"));
         }
     }
 
