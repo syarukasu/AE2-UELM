@@ -24,6 +24,7 @@ import appeng.rebuild.quantity.AEAmount;
  * {@link #initialStorageDebits()} and recheck its dependencies before any physical mutation takes place.
  */
 public final class ExactCraftingPlan {
+    private final ExactPlanId planId;
     private final GridRevision planningRevision;
     private final GridRevision validationRevision;
     private final ExactCraftRequest request;
@@ -34,10 +35,12 @@ public final class ExactCraftingPlan {
     private final Map<KeyId, AEAmount> finalSurplus;
     private final DependencySet dependencies;
 
-    ExactCraftingPlan(GridRevision planningRevision, GridRevision validationRevision, ExactCraftRequest request,
+    ExactCraftingPlan(ExactPlanId planId, GridRevision planningRevision, GridRevision validationRevision,
+            ExactCraftRequest request,
             List<PlannedCausalStep> causalSteps, Map<PatternId, PatternRevision> usedPatternRevisions,
             Map<PatternId, AEAmount> patternExecutions, Map<KeyId, AEAmount> initialStorageDebits,
             Map<KeyId, AEAmount> finalSurplus, DependencySet dependencies) {
+        this.planId = Objects.requireNonNull(planId, "planId");
         this.planningRevision = Objects.requireNonNull(planningRevision, "planningRevision");
         this.validationRevision = Objects.requireNonNull(validationRevision, "validationRevision");
         this.request = Objects.requireNonNull(request, "request");
@@ -47,6 +50,11 @@ public final class ExactCraftingPlan {
         this.initialStorageDebits = copyKeyAmounts(initialStorageDebits, "initialStorageDebits");
         this.finalSurplus = copyKeyAmounts(finalSurplus, "finalSurplus");
         this.dependencies = Objects.requireNonNull(dependencies, "dependencies");
+    }
+
+    /** Durable identity assigned by {@link ExactCraftingPlanValidator} when this plan was successfully sealed. */
+    public ExactPlanId planId() {
+        return planId;
     }
 
     public GridRevision planningRevision() {

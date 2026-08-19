@@ -108,9 +108,9 @@ public final class ExactCraftingPlanValidator {
         }
         validateStorageDebits(draft, summary.debits, storage, work);
 
-        return new ExactPlanValidationResult.Success(new ExactCraftingPlan(draft.gridRevision(), validationRevision,
-                draft.request(), steps, usedRevisions, executions, summary.debits, summary.surplus,
-                draft.dependencies()));
+        return new ExactPlanValidationResult.Success(new ExactCraftingPlan(ExactPlanId.fresh(), draft.gridRevision(),
+                validationRevision, draft.request(), steps, usedRevisions, executions, summary.debits,
+                summary.surplus, draft.dependencies()));
     }
 
     private StepData validateNormal(PlannedPatternBatch batch, NormalizedPatternSnapshot patterns,
