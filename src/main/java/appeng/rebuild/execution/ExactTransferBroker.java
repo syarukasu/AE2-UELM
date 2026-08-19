@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.UUID;
 
 import appeng.api.config.Actionable;
 import appeng.api.networking.security.IActionSource;
@@ -37,6 +38,8 @@ public final class ExactTransferBroker {
     private CpuPlanHandle handle;
     private ExactPlanId planId;
     private ReservationId reservationId;
+    private WorkOrderId workOrderId;
+    private UUID leaseIdentity;
     private final TreeMap<KeyId, AEAmount> escrowed = new TreeMap<>(Comparator.comparingInt(KeyId::value));
 
     public ExactTransferBroker(BrokerExactStorage storage, CurrentPatternSnapshotSource patternSnapshots,
@@ -175,6 +178,84 @@ public final class ExactTransferBroker {
     }
 
     /**
+     * Transfers one complete exact escrow to a unique work order.
+     *
+     * <p>
+     * This is intentionally package-private: only the server-thread execution boundary may turn a CPU reservation into
+     * runnable work. Once the ledger handoff succeeds, this broker has no release or cancellation path for the moved
+     * materials.
+     */
+    synchronized ExactTransferBrokerResult startWorkOrder(ExactCpuLedger requestedLedger,
+            CpuPlanHandle requestedHandle) {
+        ExactTransferBrokerResult.Failure admission = beginOperation();
+        if (admission != null) {
+            return admission;
+        }
+        try {
+            if (state == ExactTransferBrokerState.FAIL_CLOSED) {
+                return failure(ExactTransferBrokerResult.FailureReason.FAIL_CLOSED);
+            }
+            if (state != ExactTransferBrokerState.RESERVED) {
+                return failure(ExactTransferBrokerResult.FailureReason.WRONG_STATE);
+            }
+            if (ledger != requestedLedger || handle == null || !handle.equals(requestedHandle) || planId == null
+                    || reservationId == null) {
+                return failure(ExactTransferBrokerResult.FailureReason.IDENTITY_MISMATCH);
+            }
+
+            ExactCpuLedgerSnapshot cpu;
+            Map<KeyId, AEAmount> custody;
+            try {
+                cpu = requestedLedger.snapshot();
+                custody = ExactReservationReceipt.copyDebits(escrowed, "escrowed");
+            } catch (RuntimeException failure) {
+                return failure(ExactTransferBrokerResult.FailureReason.SNAPSHOT_UNAVAILABLE);
+            }
+            if (cpu.state() != ExactCpuLedgerState.RESERVED || !cpu.handle().equals(Optional.of(handle))
+                    || !cpu.reservationId().equals(Optional.of(reservationId)) || !cpu.reservedDebits().equals(custody)
+                    || cpu.releaseObligation().isPresent() || cpu.leaseIdentity().isPresent()) {
+                return failure(ExactTransferBrokerResult.FailureReason.IDENTITY_MISMATCH);
+            }
+
+            // Complete every allocation and validation which can throw before the irreversible CPU ownership handoff.
+            WorkOrderId stagedWorkOrderId = WorkOrderId.fresh();
+            WorkOrderStaging staging = new WorkOrderStaging(stagedWorkOrderId, planId, handle, reservationId, custody,
+                    storage, serverThread, actionSource, requestedLedger);
+
+            ExactCpuLedgerResult handoff = requestedLedger.handoff(handle);
+            if (!(handoff instanceof ExactCpuLedgerResult.HandedOff handedOff)) {
+                return failure(ExactTransferBrokerResult.FailureReason.CPU_REJECTED);
+            }
+            ReservedPlanLease lease = handedOff.lease();
+            if (!staging.matches(lease)) {
+                // This is an impossible ledger-contract breach. Retain both physical escrow and handoff identities for
+                // durable fail-closed recovery; the broker deliberately has no release path after this point.
+                retainHandoffFailure(stagedWorkOrderId, lease);
+                return failClosed();
+            }
+
+            try {
+                // materialize only assigns already-validated, immutable references; it has no mutable broker input.
+                ExactWorkOrder workOrder = staging.materialize(lease);
+                ExactTransferBrokerResult.Started result = new ExactTransferBrokerResult.Started(workOrder);
+                escrowed.clear();
+                ledger = null;
+                workOrderId = stagedWorkOrderId;
+                leaseIdentity = lease.leaseIdentity();
+                state = ExactTransferBrokerState.LEASED;
+                return result;
+            } catch (Error fatal) {
+                // Allocation failure cannot be rolled back after CPU handoff. Preserve explicit recovery linkage
+                // instead.
+                retainHandoffFailure(stagedWorkOrderId, lease);
+                throw fatal;
+            }
+        } finally {
+            endOperation();
+        }
+    }
+
+    /**
      * Performs at most {@code operationBudget} distinct pending insert attempts. Package-private recovery authority.
      */
     synchronized ExactTransferBrokerResult progressRelease(int operationBudget) {
@@ -202,7 +283,9 @@ public final class ExactTransferBroker {
     /** Returns a detached exact observation and never acts as release authority. */
     public synchronized ExactTransferBrokerSnapshot snapshot() {
         return new ExactTransferBrokerSnapshot(state, Optional.ofNullable(handle), Optional.ofNullable(planId),
-                Optional.ofNullable(reservationId), escrowed);
+                Optional.ofNullable(reservationId), Optional.ofNullable(workOrderId),
+                Optional.ofNullable(leaseIdentity),
+                escrowed);
     }
 
     private ExactTransferBrokerResult startRollback(ExactTransferBrokerResult.FailureReason reason) {
@@ -260,6 +343,8 @@ public final class ExactTransferBroker {
         handle = requestedHandle;
         planId = plan.planId();
         reservationId = ReservationId.fresh();
+        workOrderId = null;
+        leaseIdentity = null;
         escrowed.clear();
     }
 
@@ -337,8 +422,17 @@ public final class ExactTransferBroker {
         handle = null;
         planId = null;
         reservationId = null;
+        workOrderId = null;
+        leaseIdentity = null;
         escrowed.clear();
         state = ExactTransferBrokerState.IDLE;
+    }
+
+    /** Records an already-successful CPU handoff without granting this broker another custody mutation path. */
+    private void retainHandoffFailure(WorkOrderId stagedWorkOrderId, ReservedPlanLease lease) {
+        workOrderId = stagedWorkOrderId;
+        leaseIdentity = lease.leaseIdentity();
+        state = ExactTransferBrokerState.FAIL_CLOSED;
     }
 
     private static Map<KeyId, AEAmount> sorted(Map<KeyId, AEAmount> amounts) {
@@ -351,5 +445,31 @@ public final class ExactTransferBroker {
     private static boolean validMovedAmount(AEAmount moved, AEAmount requested) {
         return moved != null && moved.toBigInteger().bitLength() <= PlannerLimits.MAX_CRAFT_QUANTITY_BITS
                 && moved.compareTo(requested) <= 0;
+    }
+
+    /** Immutable pre-handoff data which makes post-handoff work-order materialization assignment-only. */
+    private record WorkOrderStaging(WorkOrderId workOrderId, ExactPlanId planId, CpuPlanHandle handle,
+            ReservationId reservationId, Map<KeyId, AEAmount> custody, BrokerExactStorage storage,
+            ServerThreadGate serverThread, IActionSource actionSource, ExactCpuLedger ledger) {
+        private WorkOrderStaging {
+            Objects.requireNonNull(workOrderId, "workOrderId");
+            Objects.requireNonNull(planId, "planId");
+            Objects.requireNonNull(handle, "handle");
+            Objects.requireNonNull(reservationId, "reservationId");
+            custody = ExactReservationReceipt.copyDebits(custody, "custody");
+            Objects.requireNonNull(storage, "storage");
+            Objects.requireNonNull(serverThread, "serverThread");
+            Objects.requireNonNull(actionSource, "actionSource");
+            Objects.requireNonNull(ledger, "ledger");
+        }
+
+        private boolean matches(ReservedPlanLease lease) {
+            return lease != null && planId.equals(lease.planId()) && handle.equals(lease.handle())
+                    && reservationId.equals(lease.reservationId()) && custody.equals(lease.reservedDebits());
+        }
+
+        private ExactWorkOrder materialize(ReservedPlanLease lease) {
+            return ExactWorkOrder.fromStaged(workOrderId, lease, custody, storage, serverThread, actionSource, ledger);
+        }
     }
 }

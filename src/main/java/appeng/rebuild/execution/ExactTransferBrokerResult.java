@@ -4,11 +4,19 @@ import java.util.Objects;
 
 /** Opaque typed result for one exact transfer-broker operation. */
 public sealed interface ExactTransferBrokerResult permits ExactTransferBrokerResult.Reserved,
+        ExactTransferBrokerResult.Started,
         ExactTransferBrokerResult.Cancelled, ExactTransferBrokerResult.RolledBack,
         ExactTransferBrokerResult.ReleasePending, ExactTransferBrokerResult.Failure {
     record Reserved(ExactTransferBrokerSnapshot snapshot) implements ExactTransferBrokerResult {
         public Reserved {
             Objects.requireNonNull(snapshot, "snapshot");
+        }
+    }
+
+    /** The broker has transferred exact custody to one work order. */
+    record Started(ExactWorkOrder workOrder) implements ExactTransferBrokerResult {
+        public Started {
+            Objects.requireNonNull(workOrder, "workOrder");
         }
     }
 

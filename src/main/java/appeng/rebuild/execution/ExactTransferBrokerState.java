@@ -6,6 +6,8 @@ public enum ExactTransferBrokerState {
     PREFLIGHT,
     EXTRACTING,
     RESERVED,
+    /** The exact escrow has been transferred to a unique work order. */
+    LEASED,
     ROLLBACK_PENDING,
     RELEASE_PENDING,
     FAIL_CLOSED
