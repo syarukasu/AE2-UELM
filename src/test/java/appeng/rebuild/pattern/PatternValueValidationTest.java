@@ -9,6 +9,7 @@ import static appeng.rebuild.pattern.PatternTestFixtures.key;
 import static appeng.rebuild.pattern.PatternTestFixtures.output;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.ArrayList;
@@ -22,6 +23,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 import appeng.rebuild.key.KeyId;
+import appeng.rebuild.key.KeyRegistry;
 import appeng.rebuild.quantity.AEAmount;
 
 /** Immutable-value and bounded-shape contract tests for normalized pattern data. */
@@ -213,6 +215,31 @@ class PatternValueValidationTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new CompiledPattern(new PatternId("compiled-processing-no-intent"), PatternKind.PROCESSING,
                         List.of(compiledInput), compiledOutputs, Optional.empty(), new PatternRevision(0L), 1L));
+    }
+
+    @Test
+    void nativeKindsCompileWithoutIntentWhileProcessingStillRequiresIt() {
+        var sourceKey = key("native-kind");
+        InputSpec input = input(List.of(candidate(sourceKey, 1L)), SubstitutionPolicy.EXACT);
+        List<OutputSpec> outputs = List.of(output(sourceKey, 1L, true));
+        MachineIntent intent = new MachineIntent("machine", "recipe", "capability", Map.of());
+        KeyRegistry registry = new KeyRegistry(12L);
+        registry.intern(sourceKey);
+
+        for (PatternKind nativeKind : List.of(PatternKind.SMITHING, PatternKind.STONECUTTING)) {
+            PatternDefinition definition = new PatternDefinition(new PatternId(nativeKind.name().toLowerCase()),
+                    nativeKind, List.of(input), outputs, Optional.empty(), new PatternRevision(0L));
+            assertInstanceOf(PatternCompileResult.Success.class,
+                    new PatternCompiler(registry).compile(definition));
+            assertThrows(IllegalArgumentException.class,
+                    () -> new PatternDefinition(new PatternId(nativeKind.name().toLowerCase() + "-intent"),
+                            nativeKind, List.of(input), outputs, Optional.of(intent), new PatternRevision(0L)));
+        }
+
+        PatternDefinition processing = new PatternDefinition(new PatternId("processing-with-intent"),
+                PatternKind.PROCESSING, List.of(input), outputs, Optional.of(intent), new PatternRevision(0L));
+        assertInstanceOf(PatternCompileResult.Success.class,
+                new PatternCompiler(registry).compile(processing));
     }
 
     @Test

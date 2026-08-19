@@ -26,8 +26,9 @@ public record PatternDefinition(PatternId id, PatternKind kind, List<InputSpec> 
         if (primaryOutputs != 1) {
             throw new IllegalArgumentException("Pattern must have exactly one primary output");
         }
-        if (kind == PatternKind.CRAFTING && machineIntent.isPresent()) {
-            throw new IllegalArgumentException("Crafting patterns cannot have machine intent");
+        if ((kind == PatternKind.CRAFTING || kind == PatternKind.SMITHING || kind == PatternKind.STONECUTTING)
+                && machineIntent.isPresent()) {
+            throw new IllegalArgumentException("Native patterns cannot have machine intent");
         }
         if (kind == PatternKind.PROCESSING && machineIntent.isEmpty()) {
             throw new IllegalArgumentException("Processing patterns require machine intent");
