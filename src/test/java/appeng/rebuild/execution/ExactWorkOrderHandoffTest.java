@@ -281,7 +281,7 @@ class ExactWorkOrderHandoffTest {
         try {
             stagedFactory = ExactWorkOrder.class.getDeclaredMethod("fromStaged", WorkOrderId.class,
                     ReservedPlanLease.class, Map.class, BrokerExactStorage.class, ServerThreadGate.class,
-                    IActionSource.class, ExactCpuLedger.class);
+                    IActionSource.class, ExactCpuLedger.class, ExactTransferBroker.class);
         } catch (ReflectiveOperationException exception) {
             throw new AssertionError("expected package-private staged work-order factory", exception);
         }
