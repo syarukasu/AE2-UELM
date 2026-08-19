@@ -50,6 +50,14 @@ public final class ExactCpuLedger {
         return new ExactCpuLedgerResult.Prepared(handle);
     }
 
+    /** Returns the handle-bound prepared plan only to the same-package transfer broker. */
+    synchronized ExactCraftingPlan preparedPlanForBroker(CpuPlanHandle expectedHandle) {
+        if (state != ExactCpuLedgerState.PREPARED || expectedHandle == null || !expectedHandle.equals(handle)) {
+            return null;
+        }
+        return preparedPlan;
+    }
+
     /**
      * Same-package broker transition that records an exact reservation receipt. The receipt must describe exactly the
      * prepared plan's initial debit; partial, extra, stale, or mismatched receipts do not change ledger state.

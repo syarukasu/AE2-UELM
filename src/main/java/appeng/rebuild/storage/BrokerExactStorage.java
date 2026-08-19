@@ -9,6 +9,12 @@ package appeng.rebuild.storage;
  * revisions, or throws without changing amounts or revisions. This stronger contract is deliberately separate from
  * {@link ExactStorage}: a broker cannot prove a reservation against an endpoint that permits ambiguous exceptions or
  * unrevisioned state changes.
+ *
+ * <p>
+ * For every bounded request, the returned moved amount is non-null, remains within the exact quantity bound, and is in
+ * the closed interval from zero through the requested amount. Returning more than requested, returning an out-of-bound
+ * value, or returning {@code null} is a protocol violation. A {@link RuntimeException} guarantees that neither amounts
+ * nor revisions changed.
  */
 public interface BrokerExactStorage extends ExactStorage {
     /** Captures one immutable, revision-consistent exact state on the owning server thread. */
