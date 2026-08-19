@@ -60,6 +60,7 @@ public final class ExactWorkOrder {
     private IssuedCommand inFlight;
     private ExactWorkDiscrepancy discrepancy;
     private ExactCompletedCommandEvidence completedEvidence;
+    private WorkOrderTransferDiscrepancy transferDiscrepancy;
     private boolean completedEvidenceProgressApplied;
     private ExactWorkOrderReleaseMode releaseMode;
     private long nextGeneration;
@@ -270,12 +271,16 @@ public final class ExactWorkOrder {
             try {
                 ExactCompletedCommandEvidence evidence = exactCompletedEvidence(completed, completion);
                 if (state == ExactWorkOrderState.CANCEL_PENDING) {
+                    WorkProgress staged = completed.command().location().isCycle()
+                            ? stageCycleProgress(completed, credited)
+                            : stageNormalProgress(completed);
                     ExactWorkOrderSnapshot proposed = snapshotForRelease(ExactWorkOrderReleaseMode.CANCELLATION,
-                            credited);
+                            credited, staged);
                     ExactWorkOrderTransitionResult.Completed result = new ExactWorkOrderTransitionResult.Completed(
                             proposed);
                     custody = credited;
                     inFlight = null;
+                    applyProgress(staged);
                     releaseMode = ExactWorkOrderReleaseMode.CANCELLATION;
                     state = ExactWorkOrderState.RELEASE_PENDING;
                     return result;
@@ -323,7 +328,7 @@ public final class ExactWorkOrder {
                 Optional.ofNullable(outstanding).map(IssuedCommand::command), Optional.ofNullable(inFlight)
                         .map(IssuedCommand::command),
                 Optional.ofNullable(discrepancy), Optional.ofNullable(completedEvidence),
-                completedEvidenceProgressApplied);
+                completedEvidenceProgressApplied, Optional.ofNullable(transferDiscrepancy));
     }
 
     /**
@@ -341,17 +346,26 @@ public final class ExactWorkOrder {
                 progress.remainingExecutions(), progress.selectionRemaining(), progress.cycleRemainingRepetitions(),
                 progress.cycleMemberIndex(), progress.cycleMemberRemainingExecutions(),
                 progress.cycleSelectionRemaining(), Optional.empty(), nextGeneration, generationExhausted,
-                Optional.empty(),
-                Optional.empty(), Optional.empty(), Optional.empty(), false);
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false,
+                Optional.ofNullable(transferDiscrepancy));
     }
 
     private ExactWorkOrderSnapshot snapshotForRelease(ExactWorkOrderReleaseMode proposedMode,
             Map<KeyId, AEAmount> proposedCustody) {
+        return snapshotForRelease(proposedMode, proposedCustody,
+                new WorkProgress(causalStepIndex, remainingExecutions, selectionRemaining, cycleRemainingRepetitions,
+                        cycleMemberIndex, cycleMemberRemainingExecutions, cycleSelectionRemaining));
+    }
+
+    private ExactWorkOrderSnapshot snapshotForRelease(ExactWorkOrderReleaseMode proposedMode,
+            Map<KeyId, AEAmount> proposedCustody, WorkProgress progress) {
         return new ExactWorkOrderSnapshot(ExactWorkOrderState.RELEASE_PENDING, lease.planId(), lease.handle(),
-                lease.reservationId(), lease.leaseIdentity(), workOrderId, proposedCustody, causalStepIndex,
-                remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
-                cycleMemberRemainingExecutions, cycleSelectionRemaining, Optional.of(proposedMode), nextGeneration,
-                generationExhausted, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false);
+                lease.reservationId(), lease.leaseIdentity(), workOrderId, proposedCustody, progress.causalStepIndex(),
+                progress.remainingExecutions(), progress.selectionRemaining(), progress.cycleRemainingRepetitions(),
+                progress.cycleMemberIndex(), progress.cycleMemberRemainingExecutions(),
+                progress.cycleSelectionRemaining(), Optional.of(proposedMode), nextGeneration,
+                generationExhausted, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false,
+                Optional.ofNullable(transferDiscrepancy));
     }
 
     private ExactWorkOrderSnapshot snapshotForCancellationWait() {
@@ -360,7 +374,7 @@ public final class ExactWorkOrder {
                 remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
                 cycleMemberRemainingExecutions, cycleSelectionRemaining, Optional.empty(), nextGeneration,
                 generationExhausted, Optional.empty(), Optional.of(inFlight.command()), Optional.empty(),
-                Optional.empty(), false);
+                Optional.empty(), false, Optional.ofNullable(transferDiscrepancy));
     }
 
     private ExactWorkOrderSnapshot snapshotForCompleted(ExactWorkOrderReleaseMode outcome) {
@@ -368,7 +382,8 @@ public final class ExactWorkOrder {
                 lease.reservationId(), lease.leaseIdentity(), workOrderId, Map.of(), causalStepIndex,
                 remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
                 cycleMemberRemainingExecutions, cycleSelectionRemaining, Optional.of(outcome), nextGeneration,
-                generationExhausted, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false);
+                generationExhausted, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), false,
+                Optional.ofNullable(transferDiscrepancy));
     }
 
     /** Requests a durable cancellation. An already accepted physical command remains its sole completion authority. */
@@ -432,7 +447,7 @@ public final class ExactWorkOrder {
                     continue;
                 }
                 if (!validMovedAmount(inserted, entry.getValue())) {
-                    return failLifecycle(ExactWorkOrderLifecycleResult.Reason.STORAGE_PROTOCOL_VIOLATION);
+                    return retainTransferDiscrepancy(entry.getKey(), entry.getValue(), inserted);
                 }
                 if (!inserted.equals(AEAmount.ZERO)) {
                     TreeMap<KeyId, AEAmount> proposedCustody = new TreeMap<>(KEY_ORDER);
@@ -617,6 +632,24 @@ public final class ExactWorkOrder {
         completedEvidenceProgressApplied = progressApplied;
         state = ExactWorkOrderState.FAIL_CLOSED;
         return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
+    }
+
+    private ExactWorkOrderLifecycleResult.Failure retainTransferDiscrepancy(KeyId key, AEAmount requested,
+            AEAmount returned) {
+        WorkOrderTransferDiscrepancy.Reason reason;
+        Optional<AEAmount> reported = Optional.empty();
+        if (returned == null) {
+            reason = WorkOrderTransferDiscrepancy.Reason.NULL_RETURN;
+        } else if (returned.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS) {
+            reason = WorkOrderTransferDiscrepancy.Reason.UNBOUNDED_RETURN;
+        } else {
+            reason = WorkOrderTransferDiscrepancy.Reason.OUT_OF_RANGE_RETURN;
+            reported = Optional.of(returned);
+        }
+        transferDiscrepancy = new WorkOrderTransferDiscrepancy(reason, lease.planId(), lease.handle(),
+                lease.reservationId(), lease.leaseIdentity(), workOrderId, key, requested, reported, custody);
+        state = ExactWorkOrderState.FAIL_CLOSED;
+        return lifecycleFailure(ExactWorkOrderLifecycleResult.Reason.STORAGE_PROTOCOL_VIOLATION);
     }
 
     private ExactCompletedCommandEvidence exactCompletedEvidence(IssuedCommand completed,

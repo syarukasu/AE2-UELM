@@ -24,6 +24,12 @@ public final class ReleaseObligation {
         this.reservedDebits = ExactReservationReceipt.copyDebits(reservedDebits, "reservedDebits");
     }
 
+    /** Creates immutable checkpoint data only; it grants no broker, storage, or lifecycle mutation capability. */
+    public static ReleaseObligation restoreForRecovery(CpuPlanHandle handle, ReservationId reservationId,
+            Map<KeyId, AEAmount> reservedDebits) {
+        return new ReleaseObligation(handle, reservationId, reservedDebits);
+    }
+
     public CpuPlanHandle handle() {
         return handle;
     }

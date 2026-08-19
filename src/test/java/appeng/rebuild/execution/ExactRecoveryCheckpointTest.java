@@ -1,7 +1,6 @@
 package appeng.rebuild.execution;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -119,18 +118,18 @@ class ExactRecoveryCheckpointTest {
         ExactTransferBrokerSnapshot broker = new ExactTransferBrokerSnapshot(ExactTransferBrokerState.FAIL_CLOSED,
                 Optional.of(HANDLE), Optional.of(plan.planId()), Optional.of(RESERVATION), Optional.of(WORK_ORDER),
                 Optional.of(LEASE), plan.initialStorageDebits(), Optional.empty());
-        ReservedPlanLease lease = new ReservedPlanLease(LEASE, HANDLE, RESERVATION, plan,
+        FailedHandoffRecovery lease = new FailedHandoffRecovery(LEASE, HANDLE, RESERVATION, plan.planId(),
                 plan.initialStorageDebits());
 
         ExactRecoveryCheckpoint checkpoint = new ExactRecoveryCheckpoint(plan, ledger, broker, Optional.empty(),
                 Optional.of(lease), true);
 
-        assertSame(plan, checkpoint.plan());
-        assertSame(plan, checkpoint.failedHandoffLease().orElseThrow().plan());
+        assertEquals(plan, checkpoint.plan());
+        assertEquals(lease, checkpoint.failedHandoff().orElseThrow());
 
         ExactCraftingPlan otherPlan = plan();
-        ReservedPlanLease mismatchedLease = new ReservedPlanLease(LEASE, HANDLE, RESERVATION, otherPlan,
-                otherPlan.initialStorageDebits());
+        FailedHandoffRecovery mismatchedLease = new FailedHandoffRecovery(LEASE, HANDLE, RESERVATION,
+                otherPlan.planId(), otherPlan.initialStorageDebits());
         assertThrows(IllegalArgumentException.class,
                 () -> new ExactRecoveryCheckpoint(plan, ledger, broker, Optional.empty(),
                         Optional.of(mismatchedLease), true));
@@ -158,7 +157,7 @@ class ExactRecoveryCheckpointTest {
 
     private static ExactWorkOrderSnapshot readyWork(ExactCraftingPlan plan) {
         return new ExactWorkOrderSnapshot(ExactWorkOrderState.READY, plan.planId(), HANDLE, RESERVATION, LEASE,
-                WORK_ORDER, Map.of(), 0, AEAmount.ZERO, List.of(), AEAmount.ZERO, -1, AEAmount.ZERO, List.of(),
+                WORK_ORDER, Map.of(), 0, AEAmount.ONE, List.of(), AEAmount.ZERO, -1, AEAmount.ZERO, List.of(),
                 Optional.empty(), 0L, false, Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
                 false);
     }

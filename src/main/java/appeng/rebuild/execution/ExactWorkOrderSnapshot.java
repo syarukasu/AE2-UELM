@@ -28,7 +28,7 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
         long nextGeneration, boolean generationExhausted,
         Optional<ExactWorkCommand> outstandingCommand, Optional<ExactWorkCommand> inFlightCommand,
         Optional<ExactWorkDiscrepancy> discrepancy, Optional<ExactCompletedCommandEvidence> completedEvidence,
-        boolean completedEvidenceProgressApplied) {
+        boolean completedEvidenceProgressApplied, Optional<WorkOrderTransferDiscrepancy> transferDiscrepancy) {
     public ExactWorkOrderSnapshot {
         Objects.requireNonNull(state, "state");
         Objects.requireNonNull(planId, "planId");
@@ -88,6 +88,7 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
         inFlightCommand = Objects.requireNonNull(inFlightCommand, "inFlightCommand");
         discrepancy = Objects.requireNonNull(discrepancy, "discrepancy");
         completedEvidence = Objects.requireNonNull(completedEvidence, "completedEvidence");
+        transferDiscrepancy = Objects.requireNonNull(transferDiscrepancy, "transferDiscrepancy");
         if (nextGeneration < 0) {
             throw new IllegalArgumentException("nextGeneration must be non-negative");
         }
@@ -95,7 +96,8 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
             throw new IllegalArgumentException("Exhausted command generation must be frozen at Long.MAX_VALUE");
         }
         int authorityCount = (outstandingCommand.isPresent() ? 1 : 0) + (inFlightCommand.isPresent() ? 1 : 0)
-                + (discrepancy.isPresent() ? 1 : 0) + (completedEvidence.isPresent() ? 1 : 0);
+                + (discrepancy.isPresent() ? 1 : 0) + (completedEvidence.isPresent() ? 1 : 0)
+                + (transferDiscrepancy.isPresent() ? 1 : 0);
         if (authorityCount > 1) {
             throw new IllegalArgumentException("A work order can retain at most one command evidence authority");
         }
@@ -132,6 +134,13 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
         if (completedEvidence.isEmpty() && completedEvidenceProgressApplied) {
             throw new IllegalArgumentException("Completion-progress flag requires completed evidence");
         }
+        if (transferDiscrepancy.isPresent()) {
+            WorkOrderTransferDiscrepancy value = transferDiscrepancy.orElseThrow();
+            require(value.planId().equals(planId) && value.handle().equals(handle)
+                    && value.reservationId().equals(reservationId) && value.leaseIdentity().equals(leaseIdentity)
+                    && value.workOrderId().equals(workOrderId) && value.knownCustody().equals(custody),
+                    "Work-order transfer discrepancy does not bind this exact custody observation");
+        }
         switch (state) {
             case COMMAND_OUTSTANDING -> require(outstandingCommand.isPresent() && inFlightCommand.isEmpty()
                     && discrepancy.isEmpty() && completedEvidence.isEmpty() && !completedEvidenceProgressApplied,
@@ -159,6 +168,33 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
                 // A closed order may retain either command custody linkage or immutable discrepancy evidence.
             }
         }
+        if (transferDiscrepancy.isPresent() && state != ExactWorkOrderState.FAIL_CLOSED) {
+            throw new IllegalArgumentException("Work-order transfer discrepancy requires fail-closed state");
+        }
+        if (transferDiscrepancy.isPresent() && releaseMode.isEmpty()) {
+            throw new IllegalArgumentException("Work-order transfer discrepancy requires its durable release mode");
+        }
+        if (releaseMode.isPresent()) {
+            require(outstandingCommand.isEmpty() && inFlightCommand.isEmpty() && discrepancy.isEmpty()
+                    && completedEvidence.isEmpty() && !completedEvidenceProgressApplied,
+                    "Release mode cannot retain command or completion evidence authority");
+        }
+    }
+
+    /** Source-compatible constructor for snapshots without physical-release discrepancy evidence. */
+    public ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId planId, CpuPlanHandle handle,
+            ReservationId reservationId, UUID leaseIdentity, WorkOrderId workOrderId, Map<KeyId, AEAmount> custody,
+            int causalStepIndex, AEAmount remainingExecutions, List<AEAmount> selectionRemaining,
+            AEAmount cycleRemainingRepetitions, int cycleMemberIndex, AEAmount cycleMemberRemainingExecutions,
+            List<AEAmount> cycleSelectionRemaining, Optional<ExactWorkOrderReleaseMode> releaseMode,
+            long nextGeneration, boolean generationExhausted, Optional<ExactWorkCommand> outstandingCommand,
+            Optional<ExactWorkCommand> inFlightCommand, Optional<ExactWorkDiscrepancy> discrepancy,
+            Optional<ExactCompletedCommandEvidence> completedEvidence, boolean completedEvidenceProgressApplied) {
+        this(state, planId, handle, reservationId, leaseIdentity, workOrderId, custody, causalStepIndex,
+                remainingExecutions, selectionRemaining, cycleRemainingRepetitions, cycleMemberIndex,
+                cycleMemberRemainingExecutions, cycleSelectionRemaining, releaseMode, nextGeneration,
+                generationExhausted, outstandingCommand, inFlightCommand, discrepancy, completedEvidence,
+                completedEvidenceProgressApplied, Optional.empty());
     }
 
     private static void require(boolean condition, String message) {

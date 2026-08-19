@@ -237,15 +237,13 @@ class ExactWorkOrderLifecycleTest {
     }
 
     @Test
-    void inFlightCancellationWaitsAndMatchingCompletionCreditsWithoutPlanProgress() {
+    void inFlightCancellationWaitsAndMatchingCompletionCreditsAndAppliesPlanProgress() {
         Map<Integer, AEAmount> debits = Map.of(0, AEAmount.ONE);
         Harness harness = normal("lifecycle-inflight-cancel", debits);
         ExactWorkOrder order = harness.order();
         ExactWorkCommand command = issued(order);
         ExactWorkOrderTransitionResult.Accepted accepted = assertInstanceOf(
                 ExactWorkOrderTransitionResult.Accepted.class, order.accept(new WorkCommandAcceptance(command)));
-        ExactWorkOrderSnapshot beforeCompletion = accepted.snapshot();
-
         ExactWorkOrderLifecycleResult.CancellationWaiting waiting = assertInstanceOf(
                 ExactWorkOrderLifecycleResult.CancellationWaiting.class, order.requestCancellation());
         assertEquals(ExactWorkOrderState.CANCEL_PENDING, waiting.snapshot().state());
@@ -259,9 +257,9 @@ class ExactWorkOrderLifecycleTest {
         assertEquals(ExactWorkOrderState.RELEASE_PENDING, completed.snapshot().state());
         assertEquals(Optional.of(ExactWorkOrderReleaseMode.CANCELLATION), completed.snapshot().releaseMode());
         assertTrue(completed.snapshot().inFlightCommand().isEmpty());
-        assertEquals(beforeCompletion.causalStepIndex(), completed.snapshot().causalStepIndex());
-        assertEquals(beforeCompletion.remainingExecutions(), completed.snapshot().remainingExecutions());
-        assertEquals(beforeCompletion.selectionRemaining(), completed.snapshot().selectionRemaining());
+        assertEquals(harness.plan().executionManifests().size(), completed.snapshot().causalStepIndex());
+        assertEquals(AEAmount.ZERO, completed.snapshot().remainingExecutions());
+        assertTrue(completed.snapshot().selectionRemaining().isEmpty());
         assertEquals(Map.of(outputKey(debits), AEAmount.ONE), completed.snapshot().custody());
 
         assertInstanceOf(ExactWorkOrderLifecycleResult.Cancelled.class, order.progressRelease(1));

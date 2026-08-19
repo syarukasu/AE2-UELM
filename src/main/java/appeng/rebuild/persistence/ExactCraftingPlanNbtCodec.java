@@ -120,13 +120,17 @@ public final class ExactCraftingPlanNbtCodec {
             return malformed();
         try {
             ExactKeyRemap remap = KeyTableRebinder.prospective(outerTable, current);
-            return new PersistenceDecodeResult.Success<>(new ProspectivePlan(old.rebind(remap), remap));
+            return new PersistenceDecodeResult.Success<>(new ProspectivePlan(old.rebind(remap), remap,
+                    Set.copyOf(old.keyIds())));
         } catch (RuntimeException failure) {
             return malformed();
         }
     }
 
-    record ProspectivePlan(ExactCraftingPlan plan, ExactKeyRemap remap) {
+    record ProspectivePlan(ExactCraftingPlan plan, ExactKeyRemap remap, Set<KeyId> oldKeyIds) {
+        ProspectivePlan {
+            oldKeyIds = Set.copyOf(oldKeyIds);
+        }
     }
 
     /** Encodes all authority-free sealed data, including the exact sparse key closure. */
@@ -275,7 +279,11 @@ public final class ExactCraftingPlanNbtCodec {
     private static PersistenceDecodeResult<UUID> uuid(CompoundTag tag) {
         if (!shape(tag, 1, "u", Tag.TAG_STRING))
             return malformed();
-        return PersistenceNbtCodec.decodeUuid(tag, "u");
+        PersistenceDecodeResult<UUID> decoded = PersistenceNbtCodec.decodeUuid(tag, "u");
+        if (decoded instanceof PersistenceDecodeResult.Success<UUID> success
+                && !success.value().toString().equals(tag.getString("u")))
+            return malformed();
+        return decoded;
     }
 
     private static CompoundTag request(ExactCraftRequest value) {
@@ -1117,7 +1125,7 @@ public final class ExactCraftingPlanNbtCodec {
                 : limited();
     }
 
-    private static Set<KeyId> collectKeys(ExactCraftingPlan plan) {
+    static Set<KeyId> collectKeys(ExactCraftingPlan plan) {
         Set<KeyId> keys = new HashSet<>() {
             @Override
             public boolean add(KeyId key) {
