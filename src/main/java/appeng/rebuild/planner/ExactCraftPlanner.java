@@ -26,10 +26,11 @@ import appeng.rebuild.storage.StorageSnapshot;
  * Pure, exact and bounded planner over immutable snapshots.
  *
  * <p>
- * A target producer is visited once, first as a whole and then through a bounded descending-power fallback. It is not
- * revisited after another target producer, so productive SCCs and A/B/A allocation are deliberately deferred rather
- * than approximated. Input candidates are tried in bounded cyclic rotations, and later input failure can roll a chunk
- * back to rotate an earlier input group. No operation touches world or legacy state.
+ * Each demand gets at most two deterministic producer passes. A target producer is first attempted whole and then
+ * through a bounded descending-power fallback; a second pass is only entered after the first has committed a target
+ * reduction. Productive SCCs are deliberately deferred rather than approximated. Input candidates are tried in bounded
+ * cyclic rotations, and later input failure can roll a chunk back to rotate an earlier input group. No operation
+ * touches world or legacy state.
  */
 public final class ExactCraftPlanner {
     public ExactCraftPlanResult plan(ExactCraftRequest request, StorageSnapshot storageSnapshot,
@@ -123,6 +124,8 @@ public final class ExactCraftPlanner {
                 fail(frame, ExactCraftPlanResult.FailureReason.NO_PRODUCER);
                 return;
             }
+            frame.producerPasses = 1;
+            frame.passStartRemaining = frame.remaining;
             frame.phase = Phase.NEXT_PRODUCER;
         }
 
@@ -132,6 +135,13 @@ public final class ExactCraftPlanner {
                 return;
             }
             if (frame.producerIndex >= frame.producers.size()) {
+                if (frame.producerPasses < PlannerLimits.MAX_CRAFT_PRODUCER_PASSES
+                        && frame.remaining.compareTo(frame.passStartRemaining) < 0) {
+                    frame.producerPasses++;
+                    frame.producerIndex = 0;
+                    frame.passStartRemaining = frame.remaining;
+                    return;
+                }
                 fail(frame, frame.sawCycle && !frame.sawUnsatisfiable
                         ? ExactCraftPlanResult.FailureReason.CYCLE
                         : ExactCraftPlanResult.FailureReason.UNSATISFIABLE_WITHIN_STRATEGY);
@@ -748,6 +758,8 @@ public final class ExactCraftPlanner {
         private AEAmount remaining;
         private List<Producer> producers = List.of();
         private int producerIndex;
+        private int producerPasses;
+        private AEAmount passStartRemaining;
         private Producer producer;
         private AEAmount outputPerExecution;
         private AEAmount wholeAttempt;

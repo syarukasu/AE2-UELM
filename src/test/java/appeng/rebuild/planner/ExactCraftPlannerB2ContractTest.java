@@ -178,17 +178,80 @@ class ExactCraftPlannerB2ContractTest {
     }
 
     @Test
-    void explicitAbaRevisitLimitationIsUnsatisfiableWithoutPartialDraft() {
+    void secondProducerPassCompletesAbaWithExactDeterministicCausalBatches() {
         // A must be used before B to consume the seeded link, B replenishes the link, and A must be used again.
         CompiledPattern a = oneInputOutput("aba-a", 0, 1, 1L, 1L);
         CompiledPattern b = pattern("aba-b", List.of(input(2, AEAmount.ONE,
                 List.of(candidate(2, 1L, Optional.empty())), SubstitutionPolicy.EXACT)),
                 List.of(output(0, 1L, true), output(1, 1L, false)));
+        ExactCraftRequest request = request(0, 3L);
+        Map<PatternId, Integer> priorities = Map.of(a.id(), 10, b.id(), 0);
+        StorageSnapshot storage = snapshot(3, Map.of(1, AEAmount.ONE, 2, AEAmount.ONE));
 
-        ExactCraftPlanResult.Failure failure = failure(snapshot(3, Map.of(1, AEAmount.ONE, 2, AEAmount.ONE)),
-                List.of(a, b), Map.of(a.id(), 10, b.id(), 0), request(0, 3L));
+        ExactCraftPlanDraft draft = success(storage, List.of(a, b), priorities, request);
+        ExactCraftPlanDraft repeated = success(storage, List.of(b, a), priorities, request);
+
+        assertEquals(List.of(a.id(), b.id(), a.id()),
+                draft.batches().stream().map(PlannedPatternBatch::patternId).toList());
+        assertEquals(List.of(AEAmount.ONE, AEAmount.ONE, AEAmount.ONE),
+                draft.batches().stream().map(PlannedPatternBatch::executions).toList());
+        assertEquals(Map.of(a.id(), AEAmount.of(2L), b.id(), AEAmount.ONE), draft.patternExecutions());
+        assertEquals(Map.of(new KeyId(1), AEAmount.ONE, new KeyId(2), AEAmount.ONE), draft.storageConsumed());
+        assertEquals(Map.of(), draft.surplus());
+        PlannedBatchCause.Root expectedCause = new PlannedBatchCause.Root(request.output(), request.amount());
+        assertTrue(draft.batches().stream().allMatch(batch -> batch.cause().equals(expectedCause)));
+        assertEquals(3L, draft.batches().stream().map(PlannedPatternBatch::id).distinct().count());
+        assertEquals(draft.batches().stream().map(PlannedPatternBatch::id).toList(),
+                repeated.batches().stream().map(PlannedPatternBatch::id).toList());
+    }
+
+    @Test
+    void thirdProducerPassRequirementRemainsTypedUnsatisfiableWithoutPartialDraft() {
+        // A and B can each advance once per pass. A fifth target needs the forbidden third A pass.
+        CompiledPattern a = pattern("three-pass-a", List.of(input(1, AEAmount.ONE,
+                List.of(candidate(1, 1L, Optional.empty())), SubstitutionPolicy.EXACT)),
+                List.of(output(0, 1L, true), output(2, 1L, false)));
+        CompiledPattern b = pattern("three-pass-b", List.of(
+                input(2, AEAmount.ONE, List.of(candidate(2, 1L, Optional.empty())), SubstitutionPolicy.EXACT),
+                input(3, AEAmount.ONE, List.of(candidate(3, 1L, Optional.empty())), SubstitutionPolicy.EXACT)),
+                List.of(output(0, 1L, true), output(1, 1L, false)));
+
+        ExactCraftPlanResult result = PLANNER.plan(request(0, 5L),
+                snapshot(4, Map.of(1, AEAmount.ONE, 3, AEAmount.of(2L))),
+                patternSnapshot(List.of(a, b), Map.of(a.id(), 10, b.id(), 0)));
+        ExactCraftPlanResult.Failure failure = assertInstanceOf(ExactCraftPlanResult.Failure.class, result);
 
         assertEquals(ExactCraftPlanResult.FailureReason.UNSATISFIABLE_WITHIN_STRATEGY, failure.reason());
+    }
+
+    @Test
+    void noProgressProducerPassIsNotRetriedAndLeavesOnlyUniqueObservedDependencies() {
+        CompiledPattern stalled = pattern("no-progress-stalled", List.of(input(1, AEAmount.ONE,
+                List.of(candidate(1, 2L, Optional.empty())), SubstitutionPolicy.EXACT)),
+                List.of(output(0, 1L, true)));
+        CompiledPattern laterSource = noInput("no-progress-source", 3, 1L);
+        CompiledPattern target = pattern("no-progress-target", List.of(
+                input(0, AEAmount.ONE,
+                        List.of(candidate(0, 1L, Optional.empty()), candidate(2, 1L, Optional.empty())),
+                        SubstitutionPolicy.ALLOW_ALTERNATIVES),
+                input(3, AEAmount.ONE, List.of(candidate(3, 1L, Optional.empty())), SubstitutionPolicy.EXACT)),
+                List.of(output(4, 1L, true)));
+
+        ExactCraftPlanDraft draft = success(snapshot(5, Map.of(1, AEAmount.ONE, 2, AEAmount.ONE)),
+                List.of(target, stalled, laterSource),
+                Map.of(target.id(), 0, stalled.id(), 0, laterSource.id(), 0), request(4, 1L));
+
+        assertEquals(List.of(laterSource.id(), target.id()),
+                draft.batches().stream().map(PlannedPatternBatch::patternId).toList());
+        assertEquals(List.of(new PlannedBatchId(5L), new PlannedBatchId(0L)),
+                draft.batches().stream().map(PlannedPatternBatch::id).toList());
+        assertEquals(Map.of(target.id(), AEAmount.ONE, laterSource.id(), AEAmount.ONE), draft.patternExecutions());
+        assertEquals(Map.of(new KeyId(2), AEAmount.ONE), draft.storageConsumed());
+        assertEquals(Map.of(), draft.surplus());
+        assertEquals(List.of(new KeyId(0), new KeyId(1), new KeyId(2), new KeyId(3)),
+                List.copyOf(draft.dependencies().storageKeyRevisions().keySet()));
+        assertEquals(Map.of(stalled.id(), new PatternRevision(0L), laterSource.id(), new PatternRevision(0L),
+                target.id(), new PatternRevision(0L)), draft.dependencies().patternRevisions());
     }
 
     @Test
@@ -349,20 +412,28 @@ class ExactCraftPlannerB2ContractTest {
     }
 
     @Test
-    void sameKeyOutputDisablesSeedShortcutForNGreaterThanOne() {
+    void sameKeyOutputDisablesIntraBatchSeedShortcutButCanBeReusedAcrossPasses() {
         CompiledPattern pattern = pattern("same-key-output-exclusion", List.of(input(1, AEAmount.ONE,
                 List.of(candidate(1, 2L, Optional.of(remainder(1, 1L)))), SubstitutionPolicy.EXACT)),
                 List.of(output(0, 1L, true), output(1, 1L, false)));
         AEAmount seed = AEAmount.of(3L);
         AEAmount gross = AEAmount.of(4L);
 
-        ExactCraftPlanResult.Failure seedStockFailure = failure(snapshot(2, Map.of(1, seed)), List.of(pattern),
+        ExactCraftPlanDraft seedStockDraft = success(snapshot(2, Map.of(1, seed)), List.of(pattern),
                 Map.of(pattern.id(), 0), request(0, 2L));
         ExactCraftPlanDraft grossStockDraft = success(snapshot(2, Map.of(1, gross)), List.of(pattern),
                 Map.of(pattern.id(), 0), request(0, 2L));
 
-        assertTrue(seedStockFailure.reason() == ExactCraftPlanResult.FailureReason.CYCLE
-                || seedStockFailure.reason() == ExactCraftPlanResult.FailureReason.UNSATISFIABLE_WITHIN_STRATEGY);
+        assertEquals(List.of(AEAmount.ONE, AEAmount.ONE),
+                seedStockDraft.batches().stream().map(PlannedPatternBatch::executions).toList());
+        assertTrue(seedStockDraft.batches().stream().flatMap(batch -> batch.inputs().stream())
+                .allMatch(selection -> selection.initialRequiredAmount().equals(AEAmount.of(2L))
+                        && selection.grossConsumedAmount().equals(AEAmount.of(2L))));
+        assertEquals(gross, seedStockDraft.batches().stream().flatMap(batch -> batch.inputs().stream())
+                .map(PlannedInputSelection::initialRequiredAmount).reduce(AEAmount.ZERO, AEAmount::add));
+        assertEquals(Map.of(pattern.id(), AEAmount.of(2L)), seedStockDraft.patternExecutions());
+        assertEquals(Map.of(new KeyId(1), seed), seedStockDraft.storageConsumed());
+        assertEquals(Map.of(new KeyId(1), seed), seedStockDraft.surplus());
         assertEquals(gross, grossStockDraft.batches().stream().flatMap(batch -> batch.inputs().stream())
                 .map(PlannedInputSelection::initialRequiredAmount).reduce(AEAmount.ZERO, AEAmount::add));
         assertEquals(Map.of(new KeyId(1), gross), grossStockDraft.storageConsumed());
