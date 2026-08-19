@@ -26,6 +26,8 @@ public sealed interface NormalizedPatternBuildResult
         NORMALIZATION_FAILURE,
         PATTERN_COLLISION,
         GRID_LIMIT,
+        GRAPH_FAILURE,
+        GRAPH_GENERATION_EXHAUSTED,
         DIAGNOSTIC_LIMIT,
         SERVER_CONTEXT,
         STALE_REVISION,

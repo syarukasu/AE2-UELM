@@ -73,13 +73,16 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         providers.addProvider(node(secondProvider));
 
         NormalizedPatternBuildResult buildResult = providers.buildNormalizedPatternSnapshot(
-                4L, RecipeRevision.ZERO, normalizer);
+                new GraphGeneration(0L), 4L, RecipeRevision.ZERO, normalizer);
         Success success = assertInstanceOf(Success.class, buildResult, buildResult.toString());
         NormalizedPatternSnapshot snapshot = success.snapshot();
 
         assertEquals(Map.of(firstBuiltIn.id(), compiled), snapshot.patternsById());
         assertEquals(Map.of(firstBuiltIn.id(), 9), snapshot.maxProviderPriorities());
         assertEquals(2, snapshot.eligiblePhysicalBindingCount());
+        assertEquals(new GraphGeneration(0L), snapshot.graph().generation());
+        assertEquals(snapshot.patternsById(), snapshot.graph().patternsById());
+        assertEquals(snapshot.graph().patternsById().keySet(), snapshot.maxProviderPriorities().keySet());
         assertTrue(snapshot.patternsById().keySet().stream().toList().equals(List.of(firstBuiltIn.id())));
         assertThrows(UnsupportedOperationException.class, () -> snapshot.patternsById().clear());
         assertThrows(UnsupportedOperationException.class, () -> snapshot.maxProviderPriorities().clear());
@@ -112,7 +115,8 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         providers.addProvider(node(secondProvider));
 
         Failure failure = assertInstanceOf(Failure.class,
-                providers.buildNormalizedPatternSnapshot(4L, RecipeRevision.ZERO, normalizer));
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
 
         assertEquals(NormalizedPatternBuildResult.FailureReason.PATTERN_COLLISION, failure.reason());
         assertEquals("pattern-id", failure.context());
@@ -130,7 +134,8 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         LegacyPatternNormalizer normalizer = mock(LegacyPatternNormalizer.class);
 
         Success success = assertInstanceOf(Success.class,
-                providers.buildNormalizedPatternSnapshot(4L, RecipeRevision.ZERO, normalizer));
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
 
         assertTrue(success.snapshot().hasLegacyFallback());
         assertEquals(List.of(new NormalizedPatternDiagnostic(
@@ -158,7 +163,8 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         LegacyPatternNormalizer normalizer = mock(LegacyPatternNormalizer.class);
 
         Failure result = assertInstanceOf(Failure.class,
-                providers.buildNormalizedPatternSnapshot(4L, RecipeRevision.ZERO, normalizer));
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
 
         assertEquals(NormalizedPatternBuildResult.FailureReason.PREPARATION_FAILURE, result.reason());
         assertEquals("provider-MALFORMED_PATTERN", result.context());
@@ -177,7 +183,8 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         LegacyPatternNormalizer normalizer = mock(LegacyPatternNormalizer.class);
 
         Success result = assertInstanceOf(Success.class,
-                providers.buildNormalizedPatternSnapshot(4L, RecipeRevision.ZERO, normalizer));
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
 
         assertTrue(result.snapshot().hasLegacyFallback());
         assertTrue(result.snapshot().patternsById().isEmpty());
@@ -199,8 +206,29 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         providers.addProvider(node(provider));
 
         assertEquals(fatal, assertThrows(AssertionError.class,
-                () -> providers.buildNormalizedPatternSnapshot(4L, RecipeRevision.ZERO,
+                () -> providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
                         mock(LegacyPatternNormalizer.class))));
+    }
+
+    @Test
+    void graphKeyGenerationFailureDisablesWholeShadowWithoutPartialGraph() {
+        NetworkCraftingProviders providers = new NetworkCraftingProviders();
+        BuiltIn builtIn = builtIn();
+        PatternProviderLogic provider = mock(PatternProviderLogic.class);
+        when(provider.getAvailablePatterns()).thenReturn(List.of(builtIn.details()));
+        when(provider.prepareRecipeReload(RecipeRevision.ZERO)).thenReturn(prepared(builtIn.details()));
+        providers.addProvider(node(provider));
+        LegacyPatternNormalizer normalizer = mock(LegacyPatternNormalizer.class);
+        when(normalizer.keyRegistryGeneration()).thenReturn(17L);
+        when(normalizer.normalize(any(), any(), any())).thenReturn(normalized(
+                compiled(builtIn.id().value(), 18L)));
+
+        Failure result = assertInstanceOf(Failure.class,
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
+
+        assertEquals(NormalizedPatternBuildResult.FailureReason.GRAPH_FAILURE, result.reason());
+        assertEquals("graph-MIXED_KEY_REGISTRY_GENERATION", result.context());
     }
 
     @Test
@@ -223,7 +251,8 @@ class NetworkCraftingProvidersNormalizedShadowTest {
         providers.getMediums(firstPattern).forEach(mediums::add);
         LegacyPatternNormalizer normalizer = mock(LegacyPatternNormalizer.class);
         assertInstanceOf(Success.class,
-                providers.buildNormalizedPatternSnapshot(4L, RecipeRevision.ZERO, normalizer));
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
 
         assertEquals(legacyCrafting, List.copyOf(providers.getCraftingFor(sharedOutput)));
         List<ICraftingProvider> mediumsAfterBuild = new java.util.ArrayList<>();

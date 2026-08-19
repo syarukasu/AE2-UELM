@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -100,6 +101,66 @@ class CraftingServiceNormalizedShadowTest {
                 fixture.service().getNormalizedPatternShadowState().status());
         assertTrue(fixture.service().getNormalizedPatternSnapshot().isEmpty());
         verify(fixture.provider()).prepareRecipeReload(any());
+
+        doReturn(fixture.prepared()).when(fixture.provider()).prepareRecipeReload(any());
+        fixture.service().onServerEndTick();
+        assertEquals(new GraphGeneration(0L), fixture.service().getNormalizedPatternSnapshot().orElseThrow()
+                .graph().generation());
+    }
+
+    @Test
+    void successfulDirtyRebuildAdvancesGraphGenerationOnlyAfterPublication() {
+        MinecraftServer server = server();
+        RecipeReloadCoordinator.instance().onServerAboutToStart(server);
+        CraftingServiceFixture fixture = service(server);
+        fixture.addProvider();
+
+        fixture.service().onServerEndTick();
+        assertEquals(new GraphGeneration(0L), fixture.service().getNormalizedPatternSnapshot().orElseThrow()
+                .graph().generation());
+
+        fixture.service().refreshNodeCraftingProvider(fixture.node());
+        fixture.service().onServerEndTick();
+        assertEquals(new GraphGeneration(1L), fixture.service().getNormalizedPatternSnapshot().orElseThrow()
+                .graph().generation());
+    }
+
+    @Test
+    void failedBuildDoesNotConsumeGraphGeneration() {
+        MinecraftServer server = server();
+        RecipeReloadCoordinator.instance().onServerAboutToStart(server);
+        CraftingServiceFixture fixture = service(server);
+        fixture.addProvider();
+        when(fixture.provider().prepareRecipeReload(any())).thenReturn(
+                new PatternProviderRecipeReloadFailure(PatternProviderRecipeReloadFailure.Reason.MALFORMED_PATTERN,
+                        "fixture"));
+
+        fixture.service().onServerEndTick();
+        assertEquals(NormalizedPatternShadowState.Status.DISABLED,
+                fixture.service().getNormalizedPatternShadowState().status());
+        when(fixture.provider().prepareRecipeReload(any())).thenReturn(fixture.prepared());
+        fixture.service().refreshNodeCraftingProvider(fixture.node());
+        fixture.service().onServerEndTick();
+        assertEquals(new GraphGeneration(0L), fixture.service().getNormalizedPatternSnapshot().orElseThrow()
+                .graph().generation());
+    }
+
+    @Test
+    void graphGenerationOverflowDisablesWithoutWrapping() throws Exception {
+        MinecraftServer server = server();
+        RecipeReloadCoordinator.instance().onServerAboutToStart(server);
+        CraftingServiceFixture fixture = service(server);
+        fixture.addProvider();
+        setServiceField(fixture.service(), "nextGraphGeneration", Long.MAX_VALUE);
+
+        fixture.service().onServerEndTick();
+
+        assertEquals(NormalizedPatternShadowState.Status.DISABLED,
+                fixture.service().getNormalizedPatternShadowState().status());
+        assertEquals(FailureReason.GRAPH_GENERATION_EXHAUSTED,
+                fixture.service().getNormalizedPatternShadowState().failure().orElseThrow().reason());
+        assertTrue(fixture.service().getNormalizedPatternSnapshot().isEmpty());
+        verify(fixture.provider(), never()).prepareRecipeReload(any());
     }
 
     @Test
@@ -169,6 +230,12 @@ class CraftingServiceNormalizedShadowTest {
         Field field = RecipeReloadCoordinator.class.getDeclaredField(name);
         field.setAccessible(true);
         field.set(RecipeReloadCoordinator.instance(), value);
+    }
+
+    private static void setServiceField(CraftingService service, String name, long value) throws Exception {
+        Field field = CraftingService.class.getDeclaredField(name);
+        field.setAccessible(true);
+        field.setLong(service, value);
     }
 
     private record CraftingServiceFixture(CraftingService service, IGridNode node, PatternProviderLogic provider,

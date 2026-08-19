@@ -20,13 +20,15 @@ public final class NormalizedPatternSnapshot {
     private final RecipeRevision recipeRevision;
     private final long keyRegistryGeneration;
     private final Map<PatternId, CompiledPattern> patternsById;
+    private final CompiledPatternGraph graph;
     private final Map<PatternId, Integer> maxProviderPriorities;
     private final int eligiblePhysicalBindingCount;
     private final boolean hasLegacyFallback;
     private final List<NormalizedPatternDiagnostic> diagnostics;
 
     public NormalizedPatternSnapshot(long serverGeneration, RecipeRevision recipeRevision, long keyRegistryGeneration,
-            Map<PatternId, CompiledPattern> patternsById, Map<PatternId, Integer> maxProviderPriorities,
+            Map<PatternId, CompiledPattern> patternsById, CompiledPatternGraph graph,
+            Map<PatternId, Integer> maxProviderPriorities,
             int eligiblePhysicalBindingCount, boolean hasLegacyFallback,
             List<NormalizedPatternDiagnostic> diagnostics) {
         if (serverGeneration < 0 || keyRegistryGeneration < 0) {
@@ -36,6 +38,11 @@ public final class NormalizedPatternSnapshot {
         this.recipeRevision = Objects.requireNonNull(recipeRevision, "recipeRevision");
         this.keyRegistryGeneration = keyRegistryGeneration;
         this.patternsById = copyPatterns(patternsById, keyRegistryGeneration);
+        this.graph = Objects.requireNonNull(graph, "graph");
+        if (graph.keyRegistryGeneration() != keyRegistryGeneration || !graph.patternsById().equals(this.patternsById)) {
+            throw new IllegalArgumentException(
+                    "Normalized graph is incompatible with snapshot patterns or key generation");
+        }
         this.maxProviderPriorities = copyPriorities(maxProviderPriorities, this.patternsById);
         if (eligiblePhysicalBindingCount < 0
                 || eligiblePhysicalBindingCount > PatternLimits.MAX_NORMALIZED_PATTERN_BINDINGS_PER_GRID) {
@@ -45,8 +52,11 @@ public final class NormalizedPatternSnapshot {
             throw new IllegalArgumentException("Eligible physical binding count cannot be below normalized patterns");
         }
         this.eligiblePhysicalBindingCount = eligiblePhysicalBindingCount;
-        this.hasLegacyFallback = hasLegacyFallback;
         this.diagnostics = copyDiagnostics(diagnostics);
+        if (hasLegacyFallback != !this.diagnostics.isEmpty()) {
+            throw new IllegalArgumentException("Legacy fallback flag must match fallback diagnostics");
+        }
+        this.hasLegacyFallback = hasLegacyFallback;
     }
 
     public long serverGeneration() {
@@ -64,6 +74,11 @@ public final class NormalizedPatternSnapshot {
     /** PatternId-lexicographically sorted immutable patterns. */
     public Map<PatternId, CompiledPattern> patternsById() {
         return patternsById;
+    }
+
+    /** Immutable compiled graph built from exactly {@link #patternsById()}. */
+    public CompiledPatternGraph graph() {
+        return graph;
     }
 
     /** PatternId-lexicographically sorted immutable maximum legacy provider priorities. */

@@ -35,6 +35,10 @@ import appeng.crafting.pattern.AEStonecuttingPattern;
 import appeng.helpers.patternprovider.PatternProviderLogic;
 import appeng.hooks.ticking.TickHandler;
 import appeng.rebuild.pattern.CompiledPattern;
+import appeng.rebuild.pattern.CompiledPatternGraph;
+import appeng.rebuild.pattern.CompiledPatternGraphBuilder;
+import appeng.rebuild.pattern.GraphBuildResult;
+import appeng.rebuild.pattern.GraphGeneration;
 import appeng.rebuild.pattern.LegacyPatternNormalizer;
 import appeng.rebuild.pattern.NormalizedPatternBuildResult;
 import appeng.rebuild.pattern.NormalizedPatternDiagnostic;
@@ -153,11 +157,12 @@ public class NetworkCraftingProviders {
      * This method deliberately does not commit prepared provider state or mutate legacy provider maps. Legacy crafting
      * remains authoritative regardless of whether the returned snapshot is successful.
      */
-    public NormalizedPatternBuildResult buildNormalizedPatternSnapshot(long serverGeneration, RecipeRevision revision,
-            LegacyPatternNormalizer normalizer) {
+    public NormalizedPatternBuildResult buildNormalizedPatternSnapshot(GraphGeneration graphGeneration,
+            long serverGeneration, RecipeRevision revision, LegacyPatternNormalizer normalizer) {
         if (serverGeneration < 0) {
             throw new IllegalArgumentException("Server generation must be non-negative");
         }
+        Objects.requireNonNull(graphGeneration, "graphGeneration");
         Objects.requireNonNull(revision, "revision");
         Objects.requireNonNull(normalizer, "normalizer");
 
@@ -254,9 +259,21 @@ public class NetworkCraftingProviders {
             return failure(NormalizedPatternBuildResult.FailureReason.LEGACY_EXCEPTION, "legacy-callback");
         }
 
+        GraphBuildResult graphResult;
+        try {
+            graphResult = new CompiledPatternGraphBuilder(graphGeneration, normalizer.keyRegistryGeneration())
+                    .build(patternsById.values());
+        } catch (RuntimeException exception) {
+            return failure(NormalizedPatternBuildResult.FailureReason.GRAPH_FAILURE, "graph-runtime");
+        }
+        if (graphResult instanceof GraphBuildResult.Failure graphFailure) {
+            return failure(NormalizedPatternBuildResult.FailureReason.GRAPH_FAILURE,
+                    "graph-" + graphFailure.reason().name());
+        }
+        CompiledPatternGraph graph = ((GraphBuildResult.Success) graphResult).graph();
         return new NormalizedPatternBuildResult.Success(new NormalizedPatternSnapshot(serverGeneration, revision,
-                normalizer.keyRegistryGeneration(), patternsById, maxPriorities, physicalBindings, hasLegacyFallback,
-                List.copyOf(diagnostics)));
+                normalizer.keyRegistryGeneration(), patternsById, graph, maxPriorities, physicalBindings,
+                hasLegacyFallback, List.copyOf(diagnostics)));
     }
 
     private static boolean addFallbackDiagnostic(Set<NormalizedPatternDiagnostic> diagnostics, String context) {

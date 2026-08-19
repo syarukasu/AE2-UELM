@@ -79,6 +79,7 @@ import appeng.me.helpers.InterestManager;
 import appeng.me.helpers.StackWatcher;
 import appeng.me.service.helpers.CraftingServiceStorage;
 import appeng.me.service.helpers.NetworkCraftingProviders;
+import appeng.rebuild.pattern.GraphGeneration;
 import appeng.rebuild.pattern.GridRecipeRevisionChanged;
 import appeng.rebuild.pattern.LegacyPatternNormalizer;
 import appeng.rebuild.pattern.NormalizedPatternBuildResult;
@@ -131,6 +132,8 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
     private final NetworkCraftingProviders craftingProviders = new NetworkCraftingProviders();
     private final LegacyPatternNormalizer patternNormalizer;
     private NormalizedPatternShadowState normalizedPatternShadow;
+    private long nextGraphGeneration;
+    private boolean graphGenerationExhausted;
     private final Map<UUID, CraftingLinkNexus> craftingLinks = new HashMap<>();
     private final Multimap<AEKey, StackWatcher<ICraftingWatcherNode>> interests = HashMultimap.create();
     private final InterestManager<StackWatcher<ICraftingWatcherNode>> interestManager = new InterestManager<>(
@@ -152,6 +155,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         bindRecipeReloadFailureObserver();
         RecipeReloadState reloadState = RecipeReloadCoordinator.instance().currentState();
         this.normalizedPatternShadow = initialShadowState(reloadState);
+        this.nextGraphGeneration = 0;
         this.lastProcessedCraftingLogicChangeTick = TickHandler.instance().getCurrentTick();
         this.lastProcessedCraftableChangeTick = TickHandler.instance().getCurrentTick();
 
@@ -412,9 +416,16 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
                     "coordinator-before-build");
             return;
         }
+        if (graphGenerationExhausted || nextGraphGeneration == Long.MAX_VALUE) {
+            graphGenerationExhausted = true;
+            disableNormalizedPatternShadow(NormalizedPatternBuildResult.FailureReason.GRAPH_GENERATION_EXHAUSTED,
+                    "graph-generation-exhausted");
+            return;
+        }
+        GraphGeneration graphGeneration = new GraphGeneration(nextGraphGeneration);
         try {
             NormalizedPatternBuildResult result = craftingProviders.buildNormalizedPatternSnapshot(
-                    target.serverGeneration(), target.recipeRevision(), patternNormalizer);
+                    graphGeneration, target.serverGeneration(), target.recipeRevision(), patternNormalizer);
             if (result instanceof NormalizedPatternBuildResult.Success success) {
                 if (normalizedPatternShadow != target) {
                     return;
@@ -424,9 +435,13 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
                             "coordinator-after-build");
                     return;
                 }
-                normalizedPatternShadow = new NormalizedPatternShadowState(NormalizedPatternShadowState.Status.ACTIVE,
+                long followingGraphGeneration = Math.incrementExact(nextGraphGeneration);
+                NormalizedPatternShadowState activeState = new NormalizedPatternShadowState(
+                        NormalizedPatternShadowState.Status.ACTIVE,
                         success.snapshot().serverGeneration(), success.snapshot().recipeRevision(),
                         Optional.of(success.snapshot()), Optional.empty());
+                nextGraphGeneration = followingGraphGeneration;
+                normalizedPatternShadow = activeState;
             } else {
                 disableNormalizedPatternShadow(((NormalizedPatternBuildResult.Failure) result).reason(),
                         ((NormalizedPatternBuildResult.Failure) result).context());
