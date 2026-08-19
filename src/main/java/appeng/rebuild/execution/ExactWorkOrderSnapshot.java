@@ -22,6 +22,8 @@ import appeng.rebuild.quantity.AEAmount;
 public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId planId, CpuPlanHandle handle,
         ReservationId reservationId, UUID leaseIdentity, WorkOrderId workOrderId, Map<KeyId, AEAmount> custody,
         int causalStepIndex, AEAmount remainingExecutions, List<AEAmount> selectionRemaining,
+        AEAmount cycleRemainingRepetitions, int cycleMemberIndex, AEAmount cycleMemberRemainingExecutions,
+        List<AEAmount> cycleSelectionRemaining,
         long nextGeneration, boolean generationExhausted,
         Optional<ExactWorkCommand> outstandingCommand, Optional<ExactWorkCommand> inFlightCommand,
         Optional<ExactWorkDiscrepancy> discrepancy, Optional<ExactCompletedCommandEvidence> completedEvidence,
@@ -52,6 +54,34 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
                 throw new IllegalArgumentException("selectionRemaining entry exceeds the bounded exact quantity limit");
             }
         }
+        cycleRemainingRepetitions = Objects.requireNonNull(cycleRemainingRepetitions, "cycleRemainingRepetitions");
+        cycleMemberRemainingExecutions = Objects.requireNonNull(cycleMemberRemainingExecutions,
+                "cycleMemberRemainingExecutions");
+        if (cycleRemainingRepetitions.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS
+                || cycleMemberRemainingExecutions.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS
+                || cycleMemberIndex < -1 || cycleMemberIndex >= PlannerLimits.MAX_PRODUCTIVE_CYCLE_MEMBERS) {
+            throw new IllegalArgumentException("Cycle progress exceeds its exact bounded representation");
+        }
+        Objects.requireNonNull(cycleSelectionRemaining, "cycleSelectionRemaining");
+        if (cycleSelectionRemaining.size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
+            throw new IllegalArgumentException("cycleSelectionRemaining exceeds the bounded selection limit");
+        }
+        cycleSelectionRemaining = List.copyOf(cycleSelectionRemaining);
+        for (AEAmount amount : cycleSelectionRemaining) {
+            if (Objects.requireNonNull(amount, "cycleSelectionRemaining entry").toBigInteger()
+                    .bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS) {
+                throw new IllegalArgumentException("Cycle selection cursor exceeds the bounded exact quantity limit");
+            }
+        }
+        if (cycleMemberIndex < 0 && (!cycleRemainingRepetitions.equals(AEAmount.ZERO)
+                || !cycleMemberRemainingExecutions.equals(AEAmount.ZERO) || !cycleSelectionRemaining.isEmpty())) {
+            throw new IllegalArgumentException("No cycle member may retain cycle progress");
+        }
+        if (cycleMemberIndex >= 0 && (cycleRemainingRepetitions.equals(AEAmount.ZERO)
+                || cycleMemberRemainingExecutions.equals(AEAmount.ZERO) || !remainingExecutions.equals(AEAmount.ZERO)
+                || !selectionRemaining.isEmpty())) {
+            throw new IllegalArgumentException("An active cycle member requires positive exact progress");
+        }
         outstandingCommand = Objects.requireNonNull(outstandingCommand, "outstandingCommand");
         inFlightCommand = Objects.requireNonNull(inFlightCommand, "inFlightCommand");
         discrepancy = Objects.requireNonNull(discrepancy, "discrepancy");
@@ -75,6 +105,22 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
                 leaseIdentity, workOrderId));
         completedEvidence.ifPresent(value -> requireCommandIdentity(value.command(), planId, handle, reservationId,
                 leaseIdentity, workOrderId));
+        if (outstandingCommand.isPresent()) {
+            validateCurrentProgressLocation(outstandingCommand.get(), causalStepIndex, remainingExecutions,
+                    cycleRemainingRepetitions, cycleMemberIndex, cycleMemberRemainingExecutions);
+        }
+        if (inFlightCommand.isPresent()) {
+            validateCurrentProgressLocation(inFlightCommand.get(), causalStepIndex, remainingExecutions,
+                    cycleRemainingRepetitions, cycleMemberIndex, cycleMemberRemainingExecutions);
+        }
+        if (discrepancy.isPresent()) {
+            validateCurrentProgressLocation(discrepancy.get().command(), causalStepIndex, remainingExecutions,
+                    cycleRemainingRepetitions, cycleMemberIndex, cycleMemberRemainingExecutions);
+        }
+        if (completedEvidence.isPresent() && !completedEvidenceProgressApplied) {
+            validateCurrentProgressLocation(completedEvidence.get().command(), causalStepIndex, remainingExecutions,
+                    cycleRemainingRepetitions, cycleMemberIndex, cycleMemberRemainingExecutions);
+        }
         validateLastGeneration(outstandingCommand, nextGeneration, generationExhausted);
         validateLastGeneration(inFlightCommand, nextGeneration, generationExhausted);
         discrepancy.ifPresent(value -> validateLastGeneration(Optional.of(value.command()), nextGeneration,
@@ -130,6 +176,28 @@ public record ExactWorkOrderSnapshot(ExactWorkOrderState state, ExactPlanId plan
         long expected = generationExhausted ? Long.MAX_VALUE : nextGeneration - 1L;
         if (command.get().id().generation() != expected) {
             throw new IllegalArgumentException("Retained command must be the most recently issued generation");
+        }
+    }
+
+    /** Unapplied evidence must describe exactly the current durable causal position, never merely a matching id. */
+    private static void validateCurrentProgressLocation(ExactWorkCommand command, int causalStepIndex,
+            AEAmount remainingExecutions, AEAmount cycleRemainingRepetitions, int cycleMemberIndex,
+            AEAmount cycleMemberRemainingExecutions) {
+        ExactWorkCommandLocation location = command.location();
+        if (location.causalStepIndex() != causalStepIndex) {
+            throw new IllegalArgumentException("Retained command causal step does not match snapshot progress");
+        }
+        if (cycleMemberIndex < 0) {
+            if (location.isCycle() || !location.remainingRepetitions().equals(AEAmount.ZERO)
+                    || !location.remainingMemberExecutions().equals(remainingExecutions)) {
+                throw new IllegalArgumentException("Retained normal command does not match snapshot progress");
+            }
+            return;
+        }
+        if (!location.isCycle() || location.cycleMemberIndex() != cycleMemberIndex
+                || !location.remainingRepetitions().equals(cycleRemainingRepetitions)
+                || !location.remainingMemberExecutions().equals(cycleMemberRemainingExecutions)) {
+            throw new IllegalArgumentException("Retained cycle command does not match snapshot progress");
         }
     }
 }

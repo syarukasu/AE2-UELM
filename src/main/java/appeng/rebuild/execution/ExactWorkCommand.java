@@ -25,7 +25,7 @@ import appeng.rebuild.quantity.AEAmount;
  * handed to an executor. This is data, not acknowledgement authority.
  */
 public record ExactWorkCommand(WorkCommandId id, CpuPlanHandle handle, ReservationId reservationId,
-        PlannedBatchId batchId, CompiledPattern pattern, long executionWindow,
+        PlannedBatchId batchId, ExactWorkCommandLocation location, CompiledPattern pattern, long executionWindow,
         List<PlannedInputSelection> plannedSelections, Map<KeyId, AEAmount> custodyInputs,
         List<ExactWorkOutput> expectedOutputSlots, Map<KeyId, AEAmount> expectedOutputs,
         Map<KeyId, AEAmount> expectedRemainders) {
@@ -34,9 +34,13 @@ public record ExactWorkCommand(WorkCommandId id, CpuPlanHandle handle, Reservati
         Objects.requireNonNull(handle, "handle");
         Objects.requireNonNull(reservationId, "reservationId");
         Objects.requireNonNull(batchId, "batchId");
+        Objects.requireNonNull(location, "location");
         Objects.requireNonNull(pattern, "pattern");
         if (executionWindow <= 0) {
             throw new IllegalArgumentException("executionWindow must be positive");
+        }
+        if (AEAmount.of(executionWindow).compareTo(location.remainingMemberExecutions()) > 0) {
+            throw new IllegalArgumentException("executionWindow exceeds its exact causal member progress");
         }
         Objects.requireNonNull(plannedSelections, "plannedSelections");
         if (plannedSelections.size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {

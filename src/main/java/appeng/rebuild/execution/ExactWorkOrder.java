@@ -50,6 +50,11 @@ public final class ExactWorkOrder {
     private int causalStepIndex;
     private AEAmount remainingExecutions = AEAmount.ZERO;
     private List<AEAmount> selectionRemaining = List.of();
+    /** Exact resumable progress for the active compact cycle; absent when {@code cycleMemberIndex == -1}. */
+    private AEAmount cycleRemainingRepetitions = AEAmount.ZERO;
+    private int cycleMemberIndex = -1;
+    private AEAmount cycleMemberRemainingExecutions = AEAmount.ZERO;
+    private List<AEAmount> cycleSelectionRemaining = List.of();
     private IssuedCommand outstanding;
     private IssuedCommand inFlight;
     private ExactWorkDiscrepancy discrepancy;
@@ -103,28 +108,53 @@ public final class ExactWorkOrder {
             if (causalStepIndex >= manifests.size()) {
                 return finishIfTerminal();
             }
-            ExecutionManifest manifest = manifests.get(causalStepIndex);
-            if (!(manifest instanceof NormalExecutionManifest normal)) {
-                return new ExactWorkOrderCommandResult.CycleUnsupported(snapshot());
-            }
             if (generationExhausted) {
                 state = ExactWorkOrderState.FAIL_CLOSED;
                 return unavailable(ExactWorkOrderCommandResult.Reason.COMMAND_GENERATION_EXHAUSTED);
             }
-            if (remainingExecutions.equals(AEAmount.ZERO) || selectionRemaining.size() != normal.execution()
-                    .plannedSelections().size()) {
+            ExecutionManifest manifest = manifests.get(causalStepIndex);
+            final SealedPatternExecution execution;
+            final appeng.rebuild.planner.PlannedBatchId batchId;
+            final ExactWorkCommandLocation location;
+            final AEAmount activeRemaining;
+            final List<AEAmount> activeSelections;
+            if (manifest instanceof NormalExecutionManifest normal) {
+                execution = normal.execution();
+                batchId = normal.batchId();
+                location = ExactWorkCommandLocation.normal(causalStepIndex, remainingExecutions);
+                activeRemaining = remainingExecutions;
+                activeSelections = selectionRemaining;
+            } else if (manifest instanceof CycleExecutionManifest cycle) {
+                if (cycleMemberIndex < 0 || cycleMemberIndex >= cycle.memberExecutions().size()) {
+                    return failIssueInvariant();
+                }
+                execution = cycle.memberExecutions().get(cycleMemberIndex);
+                batchId = cycle.batchId();
+                location = ExactWorkCommandLocation.cycle(causalStepIndex, cycleMemberIndex,
+                        cycleRemainingRepetitions, cycleMemberRemainingExecutions);
+                activeRemaining = cycleMemberRemainingExecutions;
+                activeSelections = cycleSelectionRemaining;
+                if (atCycleMemberStart(execution) && !hasIncomingCycleLink(cycle)) {
+                    return failIssueInvariant();
+                }
+            } else {
+                return failIssueInvariant();
+            }
+            if (activeRemaining.equals(AEAmount.ZERO)
+                    || activeSelections.size() != execution.plannedSelections().size()) {
                 return failIssueInvariant();
             }
 
-            long maximumWindow = maximumWindow(requestedWindow, normal.execution());
+            long maximumWindow = maximumWindow(requestedWindow, execution, activeRemaining);
             if (maximumWindow <= 0) {
                 return unavailable(ExactWorkOrderCommandResult.Reason.PHYSICAL_WINDOW_UNAVAILABLE);
             }
-            ExactWorkCommand command = largestPhysicalCommand(normal, maximumWindow);
+            ExactWorkCommand command = largestPhysicalCommand(execution, batchId, location, activeSelections,
+                    maximumWindow);
             if (command == null) {
                 return unavailable(ExactWorkOrderCommandResult.Reason.PHYSICAL_WINDOW_UNAVAILABLE);
             }
-            ProgressDelta progress = ProgressDelta.from(normal.execution().plannedSelections(), selectionRemaining,
+            ProgressDelta progress = ProgressDelta.from(execution.plannedSelections(), activeSelections,
                     command.plannedSelections(), command.executionWindow());
             outstanding = new IssuedCommand(command, progress);
             state = ExactWorkOrderState.COMMAND_OUTSTANDING;
@@ -217,20 +247,6 @@ public final class ExactWorkOrder {
                             completion.actualOutputs(), completed.command().expectedRemainders(),
                             completion.actualRemainders())
                     : null;
-            final ProgressState nextProgress;
-            final int nextCausalStep;
-            try {
-                ProgressState calculated = completed.progress().apply(remainingExecutions, selectionRemaining);
-                int calculatedStep = calculated.remainingExecutions().equals(AEAmount.ZERO) ? causalStepIndex + 1
-                        : causalStepIndex;
-                nextProgress = calculatedStep == causalStepIndex ? calculated : progressAt(calculatedStep);
-                nextCausalStep = calculatedStep;
-            } catch (RuntimeException invalidProgress) {
-                if (observed != null) {
-                    return closeWithUnmergedDiscrepancy(observed);
-                }
-                return closeWithCompletedEvidence(exactCompletedEvidence(completed, completion), false);
-            }
             final TreeMap<KeyId, AEAmount> credited;
             try {
                 credited = creditCopy(custody, completion.actualOutputs(), completion.actualRemainders());
@@ -238,8 +254,7 @@ public final class ExactWorkOrder {
                 if (observed != null) {
                     return closeWithUnmergedDiscrepancy(observed);
                 }
-                return closeWithCompletedEvidence(exactCompletedEvidence(completed, completion), true, nextProgress,
-                        nextCausalStep);
+                return closeWithCompletedEvidence(exactCompletedEvidence(completed, completion), false);
             }
             if (mismatch) {
                 custody = credited;
@@ -250,23 +265,31 @@ public final class ExactWorkOrder {
             }
             try {
                 ExactCompletedCommandEvidence evidence = exactCompletedEvidence(completed, completion);
+                WorkProgress staged = completed.command().location().isCycle()
+                        ? stageCycleProgress(completed, credited)
+                        : stageNormalProgress(completed);
                 ExactWorkOrderState nextState = ExactWorkOrderState.READY;
-                if (nextCausalStep >= manifests.size()) {
+                if (staged.causalStepIndex() >= manifests.size()) {
                     if (!credited.equals(expectedTerminalCustody())) {
-                        return closeWithCompletedEvidence(credited, evidence, nextProgress, nextCausalStep);
+                        // A terminal mismatch is not an applied transition. The command evidence remains the sole
+                        // recovery authority; neither custody nor cursors may represent a partial completion.
+                        return closeWithCompletedEvidence(evidence, false);
                     }
                     nextState = ExactWorkOrderState.SETTLEMENT_PENDING;
                 }
+                // Validate the complete proposed durable observation before the first live assignment. In particular,
+                // snapshot construction must not turn an already-applied completion into evidence marked unapplied.
+                ExactWorkOrderTransitionResult.Completed result = new ExactWorkOrderTransitionResult.Completed(
+                        snapshotFor(nextState, credited, staged));
+                // All arithmetic, links, terminal checks, and persistence-shape validation occurred before this point.
+                // The following is deliberately assignment-only and cannot throw.
                 custody = credited;
                 inFlight = null;
-                remainingExecutions = nextProgress.remainingExecutions();
-                selectionRemaining = nextProgress.selectionRemaining();
-                causalStepIndex = nextCausalStep;
+                applyProgress(staged);
                 state = nextState;
-                return new ExactWorkOrderTransitionResult.Completed(snapshot());
+                return result;
             } catch (RuntimeException invariant) {
-                return closeWithCompletedEvidence(credited, exactCompletedEvidence(completed, completion), nextProgress,
-                        nextCausalStep);
+                return closeWithCompletedEvidence(exactCompletedEvidence(completed, completion), false);
             }
         } catch (RuntimeException failure) {
             return failTransitionInvariant();
@@ -279,11 +302,22 @@ public final class ExactWorkOrder {
     public synchronized ExactWorkOrderSnapshot snapshot() {
         return new ExactWorkOrderSnapshot(state, lease.planId(), lease.handle(), lease.reservationId(),
                 lease.leaseIdentity(), workOrderId, custody, causalStepIndex, remainingExecutions, selectionRemaining,
+                cycleRemainingRepetitions, cycleMemberIndex, cycleMemberRemainingExecutions, cycleSelectionRemaining,
                 nextGeneration, generationExhausted,
                 Optional.ofNullable(outstanding).map(IssuedCommand::command), Optional.ofNullable(inFlight)
                         .map(IssuedCommand::command),
                 Optional.ofNullable(discrepancy), Optional.ofNullable(completedEvidence),
                 completedEvidenceProgressApplied);
+    }
+
+    private ExactWorkOrderSnapshot snapshotFor(ExactWorkOrderState proposedState, Map<KeyId, AEAmount> proposedCustody,
+            WorkProgress progress) {
+        return new ExactWorkOrderSnapshot(proposedState, lease.planId(), lease.handle(), lease.reservationId(),
+                lease.leaseIdentity(), workOrderId, proposedCustody, progress.causalStepIndex(),
+                progress.remainingExecutions(), progress.selectionRemaining(), progress.cycleRemainingRepetitions(),
+                progress.cycleMemberIndex(), progress.cycleMemberRemainingExecutions(),
+                progress.cycleSelectionRemaining(), nextGeneration, generationExhausted, Optional.empty(),
+                Optional.empty(), Optional.empty(), Optional.empty(), false);
     }
 
     private ExactWorkOrderCommandResult.Unavailable beginIssue() {
@@ -353,20 +387,6 @@ public final class ExactWorkOrder {
         return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
     }
 
-    /** A command completed physically, so retain its staged goods and exact completion evidence before closing. */
-    private ExactWorkOrderTransitionResult.Failure closeWithCompletedEvidence(TreeMap<KeyId, AEAmount> credited,
-            ExactCompletedCommandEvidence evidence, ProgressState progress, int nextCausalStep) {
-        custody = credited;
-        inFlight = null;
-        completedEvidence = evidence;
-        completedEvidenceProgressApplied = true;
-        remainingExecutions = progress.remainingExecutions();
-        selectionRemaining = progress.selectionRemaining();
-        causalStepIndex = nextCausalStep;
-        state = ExactWorkOrderState.FAIL_CLOSED;
-        return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
-    }
-
     /** Retains executor evidence as the recovery authority when bounded exact custody cannot aggregate it. */
     private ExactWorkOrderTransitionResult.Failure closeWithUnmergedDiscrepancy(ExactWorkDiscrepancy observed) {
         inFlight = null;
@@ -384,21 +404,6 @@ public final class ExactWorkOrder {
         return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
     }
 
-    private ExactWorkOrderTransitionResult.Failure closeWithCompletedEvidence(ExactCompletedCommandEvidence evidence,
-            boolean progressApplied, ProgressState progress, int nextCausalStep) {
-        if (!progressApplied) {
-            return closeWithCompletedEvidence(evidence, false);
-        }
-        inFlight = null;
-        completedEvidence = evidence;
-        completedEvidenceProgressApplied = true;
-        remainingExecutions = progress.remainingExecutions();
-        selectionRemaining = progress.selectionRemaining();
-        causalStepIndex = nextCausalStep;
-        state = ExactWorkOrderState.FAIL_CLOSED;
-        return transitionFailure(ExactWorkOrderTransitionResult.Reason.INVARIANT_VIOLATION);
-    }
-
     private ExactCompletedCommandEvidence exactCompletedEvidence(IssuedCommand completed,
             WorkCommandCompletion completion) {
         return new ExactCompletedCommandEvidence(completed.command(), completion.actualOutputs(),
@@ -411,9 +416,7 @@ public final class ExactWorkOrder {
             selectionRemaining = List.of();
             return;
         }
-        ProgressState progress = progressAt(causalStepIndex);
-        remainingExecutions = progress.remainingExecutions();
-        selectionRemaining = progress.selectionRemaining();
+        applyProgress(initialProgressFor(causalStepIndex));
     }
 
     private ProgressState progressAt(int index) {
@@ -431,8 +434,114 @@ public final class ExactWorkOrder {
         return new ProgressState(AEAmount.ZERO, List.of());
     }
 
-    private long maximumWindow(long requestedWindow, SealedPatternExecution execution) {
-        long maximum = Math.min(requestedWindow, remainingExecutions.min(LONG_MAX_AMOUNT).longValueExact());
+    /** Computes the exact cursor movement only; no custody or order progress is committed here. */
+    private CycleProgress calculateCycleProgress(IssuedCommand completed) {
+        if (causalStepIndex >= manifests.size()
+                || !(manifests.get(causalStepIndex) instanceof CycleExecutionManifest cycle)
+                || cycleMemberIndex < 0 || cycleMemberIndex >= cycle.memberExecutions().size()
+                || !completed.command().location().equals(ExactWorkCommandLocation.cycle(causalStepIndex,
+                        cycleMemberIndex, cycleRemainingRepetitions, cycleMemberRemainingExecutions))
+                || !completed.command().batchId().equals(cycle.batchId()) || !completed.command().pattern()
+                        .equals(cycle.memberExecutions().get(cycleMemberIndex).pattern())) {
+            throw new IllegalStateException("Cycle completion does not match retained causal progress");
+        }
+        ProgressState progressed = completed.progress().apply(cycleMemberRemainingExecutions,
+                cycleSelectionRemaining);
+        return new CycleProgress(cycle, progressed);
+    }
+
+    /** Stages a complete cycle transition and validates all boundaries before any live field is assigned. */
+    private WorkProgress stageCycleProgress(IssuedCommand completed, Map<KeyId, AEAmount> credited) {
+        CycleProgress progress = calculateCycleProgress(completed);
+        if (!progress.memberProgress().remainingExecutions().equals(AEAmount.ZERO)) {
+            return new WorkProgress(causalStepIndex, remainingExecutions, selectionRemaining,
+                    cycleRemainingRepetitions, cycleMemberIndex, progress.memberProgress().remainingExecutions(),
+                    progress.memberProgress().selectionRemaining());
+        }
+        for (AEAmount cursor : progress.memberProgress().selectionRemaining()) {
+            if (!cursor.equals(AEAmount.ZERO)) {
+                throw new IllegalStateException("Completed cycle member retained a sealed selection cursor");
+            }
+        }
+        CycleExecutionManifest cycle = progress.cycle();
+        appeng.rebuild.planner.PlannedCycleLink outgoing = cycle.links().get(cycleMemberIndex);
+        AEAmount available = credited.getOrDefault(outgoing.key(), AEAmount.ZERO);
+        if (available.compareTo(outgoing.amountPerTurn()) < 0) {
+            throw new IllegalStateException("Completed cycle member did not restore its sealed outgoing link");
+        }
+        int finalMember = cycle.memberExecutions().size() - 1;
+        if (cycleMemberIndex != finalMember) {
+            return cycleProgressFor(causalStepIndex, cycle, cycleRemainingRepetitions, cycleMemberIndex + 1);
+        }
+        AEAmount restoredSeed = credited.getOrDefault(cycle.seedKey(), AEAmount.ZERO);
+        if (restoredSeed.compareTo(cycle.seedAmount()) < 0) {
+            throw new IllegalStateException("Closing cycle member did not physically restore its retained seed");
+        }
+        AEAmount afterTurn = cycleRemainingRepetitions.subtractExact(AEAmount.ONE);
+        if (!afterTurn.equals(AEAmount.ZERO)) {
+            return cycleProgressFor(causalStepIndex, cycle, afterTurn, 0);
+        }
+        return initialProgressFor(causalStepIndex + 1);
+    }
+
+    private WorkProgress stageNormalProgress(IssuedCommand completed) {
+        if (causalStepIndex >= manifests.size()
+                || !(manifests.get(causalStepIndex) instanceof NormalExecutionManifest normal)
+                || !completed.command().location().equals(ExactWorkCommandLocation.normal(causalStepIndex,
+                        remainingExecutions))
+                || !completed.command().batchId().equals(normal.batchId())
+                || !completed.command().pattern().equals(normal.execution().pattern())) {
+            throw new IllegalStateException("Normal completion does not match retained causal progress");
+        }
+        ProgressState progressed = completed.progress().apply(remainingExecutions, selectionRemaining);
+        return progressed.remainingExecutions().equals(AEAmount.ZERO)
+                ? initialProgressFor(causalStepIndex + 1)
+                : new WorkProgress(causalStepIndex, progressed.remainingExecutions(), progressed.selectionRemaining(),
+                        AEAmount.ZERO, -1, AEAmount.ZERO, List.of());
+    }
+
+    private WorkProgress initialProgressFor(int index) {
+        if (index >= manifests.size()) {
+            return new WorkProgress(index, AEAmount.ZERO, List.of(), AEAmount.ZERO, -1, AEAmount.ZERO, List.of());
+        }
+        ExecutionManifest manifest = manifests.get(index);
+        if (manifest instanceof NormalExecutionManifest) {
+            ProgressState normal = progressAt(index);
+            return new WorkProgress(index, normal.remainingExecutions(), normal.selectionRemaining(), AEAmount.ZERO, -1,
+                    AEAmount.ZERO, List.of());
+        }
+        if (manifest instanceof CycleExecutionManifest cycle) {
+            return cycleProgressFor(index, cycle, cycle.repetitions(), 0);
+        }
+        throw new IllegalStateException("Unknown sealed execution manifest");
+    }
+
+    private WorkProgress cycleProgressFor(int index, CycleExecutionManifest cycle, AEAmount repetitions,
+            int memberIndex) {
+        if (memberIndex < 0 || memberIndex >= cycle.memberExecutions().size()) {
+            throw new IllegalStateException("Cycle member index is out of bounds");
+        }
+        SealedPatternExecution member = cycle.memberExecutions().get(memberIndex);
+        ArrayList<AEAmount> cursors = new ArrayList<>(member.plannedSelections().size());
+        for (PlannedInputSelection selection : member.plannedSelections()) {
+            cursors.add(selection.templateUnits());
+        }
+        return new WorkProgress(index, AEAmount.ZERO, List.of(), repetitions, memberIndex, member.executions(),
+                List.copyOf(cursors));
+    }
+
+    private void applyProgress(WorkProgress progress) {
+        causalStepIndex = progress.causalStepIndex();
+        remainingExecutions = progress.remainingExecutions();
+        selectionRemaining = progress.selectionRemaining();
+        cycleRemainingRepetitions = progress.cycleRemainingRepetitions();
+        cycleMemberIndex = progress.cycleMemberIndex();
+        cycleMemberRemainingExecutions = progress.cycleMemberRemainingExecutions();
+        cycleSelectionRemaining = progress.cycleSelectionRemaining();
+    }
+
+    private long maximumWindow(long requestedWindow, SealedPatternExecution execution, AEAmount remaining) {
+        long maximum = Math.min(requestedWindow, remaining.min(LONG_MAX_AMOUNT).longValueExact());
         for (PlannedInputSelection selection : execution.plannedSelections()) {
             if (selection.initialRequiredAmount().compareTo(selection.grossConsumedAmount()) < 0) {
                 return Math.min(maximum, 1L);
@@ -441,20 +550,47 @@ public final class ExactWorkOrder {
         return maximum;
     }
 
+    /** Checks the complete incoming sealed link before the first physical window of a ring member is issued. */
+    private boolean hasIncomingCycleLink(CycleExecutionManifest cycle) {
+        int source = (cycleMemberIndex - 1 + cycle.memberExecutions().size()) % cycle.memberExecutions().size();
+        appeng.rebuild.planner.PlannedCycleLink incoming = cycle.links().get(source);
+        if (cycleMemberIndex == 0 && (!incoming.key().equals(cycle.seedKey())
+                || !incoming.amountPerTurn().equals(cycle.seedAmount()))) {
+            return false;
+        }
+        return custody.getOrDefault(incoming.key(), AEAmount.ZERO).compareTo(incoming.amountPerTurn()) >= 0;
+    }
+
+    private boolean atCycleMemberStart(SealedPatternExecution execution) {
+        if (!cycleMemberRemainingExecutions.equals(execution.executions())
+                || cycleSelectionRemaining.size() != execution.plannedSelections().size()) {
+            return false;
+        }
+        for (int index = 0; index < cycleSelectionRemaining.size(); index++) {
+            if (!cycleSelectionRemaining.get(index).equals(execution.plannedSelections().get(index).templateUnits())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * Finds the largest feasible physical window without assuming feasibility is globally monotonic. Candidate
      * exhaustion points partition the window into bounded pieces where every command amount and projected custody is
      * affine. Each piece is solved algebraically after a bounded physical-prefix binary search.
      */
-    private ExactWorkCommand largestPhysicalCommand(NormalExecutionManifest normal, long maximumWindow) {
-        TreeSet<Long> starts = structuralStarts(normal.execution(), maximumWindow);
+    private ExactWorkCommand largestPhysicalCommand(SealedPatternExecution execution,
+            appeng.rebuild.planner.PlannedBatchId batchId, ExactWorkCommandLocation location,
+            List<AEAmount> activeSelections, long maximumWindow) {
+        TreeSet<Long> starts = structuralStarts(execution, activeSelections, maximumWindow);
         starts.add(1L);
         ExactWorkCommand best = null;
         long lower = 1L;
         for (Long next : starts.tailSet(2L, true)) {
             long upper = next - 1L;
             if (lower <= upper) {
-                ExactWorkCommand candidate = largestInStructuralPiece(normal, lower, upper);
+                ExactWorkCommand candidate = largestInStructuralPiece(execution, batchId, location, activeSelections,
+                        lower, upper);
                 if (candidate != null && (best == null || candidate.executionWindow() > best.executionWindow())) {
                     best = candidate;
                 }
@@ -462,7 +598,8 @@ public final class ExactWorkOrder {
             lower = next;
         }
         if (lower <= maximumWindow) {
-            ExactWorkCommand candidate = largestInStructuralPiece(normal, lower, maximumWindow);
+            ExactWorkCommand candidate = largestInStructuralPiece(execution, batchId, location, activeSelections,
+                    lower, maximumWindow);
             if (candidate != null && (best == null || candidate.executionWindow() > best.executionWindow())) {
                 best = candidate;
             }
@@ -470,7 +607,8 @@ public final class ExactWorkOrder {
         return best;
     }
 
-    private TreeSet<Long> structuralStarts(SealedPatternExecution execution, long maximumWindow) {
+    private TreeSet<Long> structuralStarts(SealedPatternExecution execution, List<AEAmount> activeSelections,
+            long maximumWindow) {
         TreeSet<Long> starts = new TreeSet<>();
         for (int inputIndex = 0; inputIndex < execution.pattern().inputs().size(); inputIndex++) {
             AEAmount cumulative = AEAmount.ZERO;
@@ -480,7 +618,7 @@ public final class ExactWorkOrder {
                 if (selection.inputIndex() != inputIndex) {
                     continue;
                 }
-                cumulative = cumulative.add(selectionRemaining.get(selectionIndex));
+                cumulative = cumulative.add(activeSelections.get(selectionIndex));
                 // The next candidate starts at the first integral window whose required units exceed this completed
                 // candidate's cumulative capacity. ceil(cumulative / multiplier) is one window too early when the
                 // capacity divides exactly.
@@ -493,18 +631,20 @@ public final class ExactWorkOrder {
         return starts;
     }
 
-    private ExactWorkCommand largestInStructuralPiece(NormalExecutionManifest normal, long lower, long upper) {
-        ExactWorkCommand first = buildPhysicalCommand(normal, lower);
+    private ExactWorkCommand largestInStructuralPiece(SealedPatternExecution execution,
+            appeng.rebuild.planner.PlannedBatchId batchId, ExactWorkCommandLocation location,
+            List<AEAmount> activeSelections, long lower, long upper) {
+        ExactWorkCommand first = buildPhysicalCommand(execution, batchId, location, activeSelections, lower);
         if (first == null) {
             return null;
         }
         long physicalUpper = upper;
-        if (buildPhysicalCommand(normal, upper) == null) {
+        if (buildPhysicalCommand(execution, batchId, location, activeSelections, upper) == null) {
             long low = lower;
             long high = upper - 1L;
             while (low <= high) {
                 long middle = low + ((high - low) >>> 1);
-                if (buildPhysicalCommand(normal, middle) == null) {
+                if (buildPhysicalCommand(execution, batchId, location, activeSelections, middle) == null) {
                     high = middle - 1L;
                 } else {
                     physicalUpper = middle;
@@ -512,9 +652,9 @@ public final class ExactWorkOrder {
                 }
             }
         }
-        ExactWorkCommand last = buildPhysicalCommand(normal, physicalUpper);
+        ExactWorkCommand last = buildPhysicalCommand(execution, batchId, location, activeSelections, physicalUpper);
         long feasible = largestProjectedWindow(first, last, lower, physicalUpper);
-        return feasible < lower ? null : tryBuildCommand(normal, feasible);
+        return feasible < lower ? null : tryBuildCommand(execution, batchId, location, activeSelections, feasible);
     }
 
     private long largestProjectedWindow(ExactWorkCommand first, ExactWorkCommand last, long lower, long upper) {
@@ -617,17 +757,20 @@ public final class ExactWorkOrder {
     }
 
     /** Pure command construction: it neither advances cursors nor changes custody. */
-    private ExactWorkCommand tryBuildCommand(NormalExecutionManifest normal, long window) {
-        ExactWorkCommand command = buildPhysicalCommand(normal, window);
+    private ExactWorkCommand tryBuildCommand(SealedPatternExecution execution,
+            appeng.rebuild.planner.PlannedBatchId batchId, ExactWorkCommandLocation location,
+            List<AEAmount> activeSelections, long window) {
+        ExactWorkCommand command = buildPhysicalCommand(execution, batchId, location, activeSelections, window);
         return command != null && projectedCustody(command) != null ? command : null;
     }
 
-    private ExactWorkCommand buildPhysicalCommand(NormalExecutionManifest normal, long window) {
+    private ExactWorkCommand buildPhysicalCommand(SealedPatternExecution execution,
+            appeng.rebuild.planner.PlannedBatchId batchId, ExactWorkCommandLocation location,
+            List<AEAmount> activeSelections, long window) {
         try {
-            SealedPatternExecution execution = normal.execution();
             CompiledPattern pattern = execution.pattern();
             List<PlannedInputSelection> selections = selectionsForWindow(pattern, execution.plannedSelections(),
-                    window);
+                    activeSelections, window);
             Map<KeyId, AEAmount> inputs = aggregateInputs(selections);
             List<ExactWorkOutput> outputSlots = outputsForWindow(pattern, window);
             Map<KeyId, AEAmount> outputs = aggregateOutputs(outputSlots);
@@ -635,7 +778,7 @@ public final class ExactWorkOrder {
             ExactWorkCommand command = new ExactWorkCommand(
                     new WorkCommandId(lease.planId(), lease.leaseIdentity(), workOrderId,
                             nextGeneration),
-                    lease.handle(), lease.reservationId(), normal.batchId(), pattern, window,
+                    lease.handle(), lease.reservationId(), batchId, location, pattern, window,
                     selections,
                     inputs, outputSlots, outputs, remainders);
             return command;
@@ -645,7 +788,7 @@ public final class ExactWorkOrder {
     }
 
     private List<PlannedInputSelection> selectionsForWindow(CompiledPattern pattern,
-            List<PlannedInputSelection> originals, long window) {
+            List<PlannedInputSelection> originals, List<AEAmount> activeSelections, long window) {
         ArrayList<PlannedInputSelection> result = new ArrayList<>();
         int cursor = 0;
         AEAmount executions = AEAmount.of(window);
@@ -659,7 +802,7 @@ public final class ExactWorkOrder {
                     throw new IllegalArgumentException("Unordered sealed candidate selections");
                 }
                 priorCandidate = original.candidateIndex();
-                AEAmount available = selectionRemaining.get(cursor);
+                AEAmount available = activeSelections.get(cursor);
                 AEAmount take = need.equals(AEAmount.ZERO) ? AEAmount.ZERO : available.min(need);
                 if (!take.equals(AEAmount.ZERO)) {
                     CompiledCandidateSpec candidate = input.candidates().get(original.candidateIndex());
@@ -843,6 +986,61 @@ public final class ExactWorkOrder {
         private ProgressState {
             Objects.requireNonNull(remainingExecutions, "remainingExecutions");
             selectionRemaining = List.copyOf(Objects.requireNonNull(selectionRemaining, "selectionRemaining"));
+        }
+    }
+
+    private record CycleProgress(CycleExecutionManifest cycle, ProgressState memberProgress) {
+        private CycleProgress {
+            Objects.requireNonNull(cycle, "cycle");
+            Objects.requireNonNull(memberProgress, "memberProgress");
+        }
+    }
+
+    /** Fully staged bounded work-order position. Assignment happens only after all completion validation succeeds. */
+    private record WorkProgress(int causalStepIndex, AEAmount remainingExecutions,
+            List<AEAmount> selectionRemaining, AEAmount cycleRemainingRepetitions, int cycleMemberIndex,
+            AEAmount cycleMemberRemainingExecutions, List<AEAmount> cycleSelectionRemaining) {
+        private WorkProgress {
+            if (causalStepIndex < 0 || cycleMemberIndex < -1
+                    || cycleMemberIndex >= PlannerLimits.MAX_PRODUCTIVE_CYCLE_MEMBERS) {
+                throw new IllegalArgumentException("Invalid staged causal progress index");
+            }
+            remainingExecutions = Objects.requireNonNull(remainingExecutions, "remainingExecutions");
+            selectionRemaining = List.copyOf(Objects.requireNonNull(selectionRemaining, "selectionRemaining"));
+            cycleRemainingRepetitions = Objects.requireNonNull(cycleRemainingRepetitions,
+                    "cycleRemainingRepetitions");
+            cycleMemberRemainingExecutions = Objects.requireNonNull(cycleMemberRemainingExecutions,
+                    "cycleMemberRemainingExecutions");
+            cycleSelectionRemaining = List.copyOf(
+                    Objects.requireNonNull(cycleSelectionRemaining, "cycleSelectionRemaining"));
+            if (remainingExecutions.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS
+                    || cycleRemainingRepetitions.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS
+                    || cycleMemberRemainingExecutions.toBigInteger().bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS
+                    || selectionRemaining.size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS
+                    || cycleSelectionRemaining.size() > PlannerLimits.MAX_CRAFT_SEARCH_DECISIONS) {
+                throw new IllegalArgumentException("Staged progress exceeds exact bounded limits");
+            }
+            for (AEAmount amount : selectionRemaining) {
+                if (Objects.requireNonNull(amount, "selectionRemaining entry").toBigInteger()
+                        .bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS) {
+                    throw new IllegalArgumentException("Staged normal selection exceeds exact bounded limits");
+                }
+            }
+            for (AEAmount amount : cycleSelectionRemaining) {
+                if (Objects.requireNonNull(amount, "cycleSelectionRemaining entry").toBigInteger()
+                        .bitLength() > PlannerLimits.MAX_CRAFT_QUANTITY_BITS) {
+                    throw new IllegalArgumentException("Staged cycle selection exceeds exact bounded limits");
+                }
+            }
+            if (cycleMemberIndex < 0 && (!cycleRemainingRepetitions.equals(AEAmount.ZERO)
+                    || !cycleMemberRemainingExecutions.equals(AEAmount.ZERO) || !cycleSelectionRemaining.isEmpty())) {
+                throw new IllegalArgumentException("Inactive staged cycle cannot retain progress");
+            }
+            if (cycleMemberIndex >= 0 && (!remainingExecutions.equals(AEAmount.ZERO)
+                    || !selectionRemaining.isEmpty() || cycleRemainingRepetitions.equals(AEAmount.ZERO)
+                    || cycleMemberRemainingExecutions.equals(AEAmount.ZERO))) {
+                throw new IllegalArgumentException("Active staged cycle has ambiguous normal progress");
+            }
         }
     }
 
