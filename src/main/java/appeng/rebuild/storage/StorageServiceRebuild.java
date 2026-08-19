@@ -19,6 +19,7 @@ import appeng.api.storage.MEStorage;
 import appeng.me.storage.NetworkStorageMountObserver;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
+import appeng.rebuild.planner.PlannerLimits;
 import appeng.rebuild.quantity.AEAmount;
 import appeng.rebuild.quantity.AmountVector;
 
@@ -154,6 +155,28 @@ public final class StorageServiceRebuild implements NetworkStorageMountObserver 
             throw new IllegalStateException("Exact storage ledger is not reconciled");
         }
         return ledger;
+    }
+
+    /**
+     * Returns one exact, read-only storage snapshot without reconciling or consulting legacy storage.
+     *
+     * <p>
+     * Server thread only. A dirty or invalid exact view is unavailable; callers must wait for a later explicit end-tick
+     * reconciliation rather than retrying or consuming stale data.
+     */
+    public StorageSnapshotCaptureResult captureSnapshot() {
+        if (!valid || dirty) {
+            return new StorageSnapshotCaptureResult.Failure(StorageSnapshotCaptureResult.FailureReason.UNAVAILABLE);
+        }
+        if (keyRegistry.size() > PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS) {
+            return new StorageSnapshotCaptureResult.Failure(StorageSnapshotCaptureResult.FailureReason.KEY_LIMIT);
+        }
+        try {
+            return new StorageSnapshotCaptureResult.Success(ledger.captureSnapshot());
+        } catch (RuntimeException failure) {
+            return new StorageSnapshotCaptureResult.Failure(
+                    StorageSnapshotCaptureResult.FailureReason.LEGACY_EXCEPTION);
+        }
     }
 
     /** Returns the latest reconciliation failure, or {@code null} after the next successful reconciliation. */

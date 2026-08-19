@@ -11,6 +11,7 @@ import org.jetbrains.annotations.Nullable;
 
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
+import appeng.rebuild.planner.PlannerLimits;
 import appeng.rebuild.quantity.AEAmount;
 import appeng.rebuild.quantity.AmountVector;
 
@@ -54,6 +55,28 @@ public final class StorageLedger {
 
     public StorageRevision revision() {
         return revision;
+    }
+
+    /**
+     * Copies one internally consistent exact state without mutating this ledger or its registry.
+     *
+     * <p>
+     * Server thread only. The caller must enforce availability before exposing the returned snapshot.
+     */
+    public StorageSnapshot captureSnapshot() {
+        int keyCount = registry.size();
+        if (keyCount > PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS) {
+            throw new IllegalStateException("Storage snapshot key count exceeds the planning bound");
+        }
+        AmountVector copiedAmounts = new AmountVector(keyCount);
+        for (int index = 0; index < keyCount; index++) {
+            AEAmount amount = currentAmount(totals, index);
+            if (!amount.equals(AEAmount.ZERO)) {
+                copiedAmounts.set(index, amount);
+            }
+        }
+        return new StorageSnapshot(registry.generation(), revision, keyCount, copiedAmounts,
+                Arrays.copyOf(keyRevisions, keyCount));
     }
 
     /** Returns the revision that last changed this key's aggregate total. */
