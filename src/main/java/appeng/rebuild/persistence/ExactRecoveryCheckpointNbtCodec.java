@@ -69,9 +69,9 @@ public final class ExactRecoveryCheckpointNbtCodec {
      * Performs the bounded, type-only check required before a native owner copies untrusted durable evidence.
      *
      * <p>
-     * This intentionally does not decode or rebind a key table. Callers must retain a bounded malformed tag for a
-     * later typed decode result, while an over-limit tag must be replaced by explicit durable rejection evidence rather
-     * than copied into another unbounded object graph.
+     * This intentionally does not decode or rebind a key table. Callers must retain a bounded malformed tag for a later
+     * typed decode result, while an over-limit tag must be replaced by explicit durable rejection evidence rather than
+     * copied into another unbounded object graph.
      */
     public static EnvelopePreflight preflightEnvelope(Tag tag) {
         if (tag == null) {

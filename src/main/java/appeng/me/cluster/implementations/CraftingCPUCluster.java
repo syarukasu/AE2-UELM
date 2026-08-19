@@ -53,8 +53,13 @@ import appeng.me.cluster.IAECluster;
 import appeng.me.cluster.MBCalculator;
 import appeng.me.helpers.MachineSource;
 import appeng.me.service.StorageService;
+import appeng.rebuild.execution.CurrentPatternSnapshotSource;
+import appeng.rebuild.execution.ExactCpuExecutionSession;
+import appeng.rebuild.execution.ExactCraftingPlan;
+import appeng.rebuild.execution.ExactRecoveryActivation;
 import appeng.rebuild.execution.ExactRecoveryCheckpoint;
 import appeng.rebuild.key.KeyRegistry;
+import appeng.rebuild.storage.BrokerExactStorage;
 import appeng.util.ConfigManager;
 
 public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
@@ -77,6 +82,9 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
      */
     public final CraftingCpuLogic craftingLogic = new CraftingCpuLogic(this);
     private final ExactCpuRecoveryPersistence exactRecovery = new ExactCpuRecoveryPersistence(this::markDirty);
+    /** Exact execution is CPU-owned; no ledger, broker, or work-order reference is exposed from this cluster. */
+    @Nullable
+    private ExactCpuExecutionSession exactSession;
 
     public CraftingCPUCluster(BlockPos boundsMin, BlockPos boundsMax) {
         this.boundsMin = boundsMin.immutable();
@@ -295,13 +303,92 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     void replaceExactRecovery(ExactRecoveryCheckpoint checkpoint) {
         KeyRegistry registry = this.exactKeyRegistry();
         if (registry == null) {
-            throw new IllegalStateException("Exact recovery publication requires the current server-thread grid registry");
+            throw new IllegalStateException(
+                    "Exact recovery publication requires the current server-thread grid registry");
         }
         this.exactRecovery.replace(checkpoint, registry);
     }
 
     ExactCpuRecoveryPersistence.State exactRecoveryState() {
         return this.exactRecovery.state();
+    }
+
+    /**
+     * Creates the native CPU's one exact session and prepares a sealed plan. The caller supplies an explicitly
+     * revisioned physical endpoint; legacy long storage is never silently adapted into this authority.
+     */
+    public ExactCpuExecutionSession.ExactCpuSessionResult prepareExactPlan(ExactCraftingPlan plan,
+            BrokerExactStorage storage, CurrentPatternSnapshotSource patterns, IActionSource source) {
+        requireExactServerThread();
+        if (this.exactSession != null || this.craftingLogic.hasJob()
+                || this.exactRecovery.state() != ExactCpuRecoveryPersistence.State.ABSENT) {
+            throw new IllegalStateException("CPU cannot replace an existing crafting authority with an exact plan");
+        }
+        this.exactSession = ExactCpuExecutionSession.create(storage, patterns, this::isExactServerThread, source,
+                this::replaceExactRecovery, this::clearExactRecovery);
+        return this.exactSession.prepare(plan);
+    }
+
+    /** Advances the CPU-owned exact reservation; callers receive immutable state only. */
+    public ExactCpuExecutionSession.ExactCpuSessionResult reserveExactPlan() {
+        return requireExactSession().reserve();
+    }
+
+    /** Transfers the exact reservation into the CPU-owned work order. */
+    public ExactCpuExecutionSession.ExactCpuSessionResult startExactWorkOrder() {
+        return requireExactSession().startWorkOrder();
+    }
+
+    /**
+     * Activates a decoded native recovery tag exclusively through the CPU-owned exact-session boundary. No legacy job,
+     * storage facade, or raw saved tag is made authoritative on this path.
+     */
+    public ExactCpuExecutionSession.ActivationResult activateExactRecovery(BrokerExactStorage storage,
+            CurrentPatternSnapshotSource patterns, IActionSource source) {
+        requireExactServerThread();
+        if (this.exactSession != null || this.craftingLogic.hasJob()) {
+            return new ExactCpuExecutionSession.Rejected(ExactRecoveryActivation.Reason.REENTRANT);
+        }
+        ExactRecoveryCheckpoint checkpoint = this.exactRecovery.checkpointForActivation();
+        if (checkpoint == null) {
+            return new ExactCpuExecutionSession.Rejected(ExactRecoveryActivation.Reason.INVALID_CHECKPOINT);
+        }
+        ExactCpuExecutionSession.ActivationResult result = ExactCpuExecutionSession.activate(checkpoint, storage,
+                patterns, this::isExactServerThread, source, this::replaceExactRecovery, this::clearExactRecovery);
+        if (result instanceof ExactCpuExecutionSession.Activated activated) {
+            this.exactSession = activated.session();
+            this.exactRecovery.markActivated();
+        }
+        return result;
+    }
+
+    /** Typed exact status for packet/UI integrations; legacy views remain their explicit bounded projection. */
+    public @Nullable ExactCpuExecutionSession.ExactCpuSessionSnapshot getExactSessionSnapshot() {
+        return this.exactSession == null ? null : this.exactSession.snapshot();
+    }
+
+    private ExactCpuExecutionSession requireExactSession() {
+        requireExactServerThread();
+        if (this.exactSession == null) {
+            throw new IllegalStateException("CPU has no active exact execution session");
+        }
+        return this.exactSession;
+    }
+
+    private void clearExactRecovery() {
+        this.exactRecovery.clear();
+    }
+
+    private void requireExactServerThread() {
+        if (!this.isExactServerThread()) {
+            throw new IllegalStateException("Exact CPU execution requires its owning server thread");
+        }
+    }
+
+    private boolean isExactServerThread() {
+        CraftingBlockEntity core = this.getCore();
+        return core != null && core.getLevel() instanceof ServerLevel serverLevel
+                && serverLevel.getServer().isSameThread();
     }
 
     private @Nullable KeyRegistry exactKeyRegistry() {

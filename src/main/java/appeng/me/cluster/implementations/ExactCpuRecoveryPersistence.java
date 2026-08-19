@@ -18,8 +18,8 @@ import appeng.rebuild.persistence.PersistenceDecodeResult;
  * <p>
  * This deliberately does not adapt the legacy crafting CPU inventory into a revisioned exact endpoint. Such an adapter
  * would claim physical ownership without the guarantees required by the exact broker. Native activation is deferred
- * until Phase 9 supplies a durability-aware exact execution session. Until then, a successfully decoded checkpoint is
- * inert and legacy crafting never resumes it.
+ * until a CPU-owned durability-aware exact execution session is supplied. A decoded checkpoint stays inert until that
+ * session performs the sole activation step; legacy crafting never resumes it.
  */
 final class ExactCpuRecoveryPersistence {
     static final String TAG_EXACT_RECOVERY = "ae2_rebuild_exact_recovery";
@@ -124,6 +124,29 @@ final class ExactCpuRecoveryPersistence {
         return state;
     }
 
+    /** Returns inert decoded authority only to the owning CPU's exact-session activation boundary. */
+    @Nullable
+    ExactRecoveryCheckpoint checkpointForActivation() {
+        return state == State.PENDING_ACTIVATION ? checkpoint : null;
+    }
+
+    /** Marks a checkpoint active only after the CPU-owned session has published its canonical durable observation. */
+    void markActivated() {
+        if (state != State.PENDING_ACTIVATION || checkpoint == null) {
+            throw new IllegalStateException("Only a decoded inert checkpoint can become an active exact CPU session");
+        }
+        state = State.ACTIVE;
+    }
+
+    /** Removes only a checkpoint whose live authority has completed; the dirty notification precedes publication. */
+    void clear() {
+        changed.run();
+        rawTag = null;
+        checkpoint = null;
+        decodeFailure = null;
+        state = State.ABSENT;
+    }
+
     @Nullable
     PersistenceDecodeResult.Reason decodeFailure() {
         return decodeFailure;
@@ -152,6 +175,7 @@ final class ExactCpuRecoveryPersistence {
         ABSENT,
         PENDING_KEY_REGISTRY,
         PENDING_ACTIVATION,
+        ACTIVE,
         DECODE_REJECTED
     }
 }

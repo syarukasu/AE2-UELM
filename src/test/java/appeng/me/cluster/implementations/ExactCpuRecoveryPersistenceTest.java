@@ -18,6 +18,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
@@ -27,10 +28,15 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 
+import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEKey;
 import appeng.rebuild.execution.CpuPlanHandle;
+import appeng.rebuild.execution.ExactCpuExecutionSession;
 import appeng.rebuild.execution.ExactCpuLedgerSnapshot;
 import appeng.rebuild.execution.ExactCpuLedgerState;
+import appeng.rebuild.execution.ExactCraftingPlan;
+import appeng.rebuild.execution.ExactCraftingPlanValidator;
+import appeng.rebuild.execution.ExactPlanValidationResult;
 import appeng.rebuild.execution.ExactRecoveryCheckpoint;
 import appeng.rebuild.execution.ExactTransferBrokerSnapshot;
 import appeng.rebuild.execution.ExactTransferBrokerState;
@@ -56,9 +62,6 @@ import appeng.rebuild.persistence.PersistenceLimits;
 import appeng.rebuild.planner.ExactCraftPlanResult;
 import appeng.rebuild.planner.ExactCraftPlanner;
 import appeng.rebuild.planner.ExactCraftRequest;
-import appeng.rebuild.execution.ExactCraftingPlan;
-import appeng.rebuild.execution.ExactCraftingPlanValidator;
-import appeng.rebuild.execution.ExactPlanValidationResult;
 import appeng.rebuild.quantity.AEAmount;
 import appeng.rebuild.quantity.AmountVector;
 import appeng.rebuild.storage.StorageRevision;
@@ -187,6 +190,75 @@ class ExactCpuRecoveryPersistenceTest {
             assertEquals(ExactCpuRecoveryPersistence.State.PENDING_ACTIVATION, reader.state());
             assertEquals(2, current.size());
         }
+    }
+
+    @Test
+    void decodedCheckpointActivatesOneExactSessionAndPublishesTheCanonicalRoundTrip() {
+        Fixture fixture = fixture(AEAmount.ONE);
+        ExactRecoveryCheckpoint expected = reserved(fixture);
+        ExactCpuRecoveryPersistence writer = new ExactCpuRecoveryPersistence(() -> {
+            // Persistence-only fixture; no native block entity is involved.
+        });
+        try (MockedStatic<AEKey> ignored = decoder(fixture)) {
+            writer.replace(expected, fixture.source());
+        }
+        CompoundTag owner = new CompoundTag();
+        writer.writeToNbt(owner);
+
+        ExactCpuRecoveryPersistence reader = new ExactCpuRecoveryPersistence(() -> {
+            throw new AssertionError("session activation must not dirty the native CPU");
+        });
+        KeyRegistry current = new KeyRegistry(KEY_GENERATION + 7);
+        try (MockedStatic<AEKey> ignored = decoder(fixture)) {
+            reader.readFromNbt(owner, null);
+            reader.decodeIfPossible(current);
+        }
+        ExactRecoveryCheckpoint decoded = reader.checkpointForActivation();
+        assertCheckpointEquivalent(expected, decoded);
+
+        AtomicReference<ExactRecoveryCheckpoint> published = new AtomicReference<>();
+        ExactCpuExecutionSession.ActivationResult activation = ExactCpuExecutionSession.activate(decoded,
+                mock(appeng.rebuild.storage.BrokerExactStorage.class), () -> null, () -> true,
+                IActionSource.empty(), published::set, () -> {
+                    throw new AssertionError("active session must not clear its recovery authority");
+                });
+        ExactCpuExecutionSession.Activated activated = assertInstanceOf(ExactCpuExecutionSession.Activated.class,
+                activation);
+        assertEquals(expected.ledger(), activated.snapshot().ledger());
+        assertEquals(expected.broker(), activated.snapshot().broker());
+        assertEquals(expected.workOrder(), activated.snapshot().workOrder());
+        assertCheckpointEquivalent(expected, published.get());
+
+        reader.markActivated();
+        assertEquals(ExactCpuRecoveryPersistence.State.ACTIVE, reader.state());
+        assertThrows(IllegalStateException.class, reader::markActivated);
+    }
+
+    private static void assertCheckpointEquivalent(ExactRecoveryCheckpoint expected,
+            ExactRecoveryCheckpoint actual) {
+        assertEquals(expected.plan().planId(), actual.plan().planId());
+        assertGridRevisionEquivalent(expected.plan().planningRevision(), actual.plan().planningRevision());
+        assertGridRevisionEquivalent(expected.plan().validationRevision(), actual.plan().validationRevision());
+        assertEquals(expected.plan().request(), actual.plan().request());
+        assertEquals(expected.plan().usedPatternRevisions(), actual.plan().usedPatternRevisions());
+        assertEquals(expected.plan().patternExecutions(), actual.plan().patternExecutions());
+        assertEquals(expected.plan().initialStorageDebits(), actual.plan().initialStorageDebits());
+        assertEquals(expected.plan().finalSurplus(), actual.plan().finalSurplus());
+        assertEquals(expected.plan().causalSteps().size(), actual.plan().causalSteps().size());
+        assertEquals(expected.plan().executionManifests().size(), actual.plan().executionManifests().size());
+        assertEquals(expected.ledger(), actual.ledger());
+        assertEquals(expected.broker(), actual.broker());
+        assertEquals(expected.workOrder(), actual.workOrder());
+        assertEquals(expected.failedHandoff(), actual.failedHandoff());
+        assertEquals(expected.recoveryRequired(), actual.recoveryRequired());
+    }
+
+    private static void assertGridRevisionEquivalent(appeng.rebuild.planner.GridRevision expected,
+            appeng.rebuild.planner.GridRevision actual) {
+        assertEquals(expected.serverGeneration(), actual.serverGeneration());
+        assertEquals(expected.graphGeneration(), actual.graphGeneration());
+        assertEquals(expected.recipeRevision(), actual.recipeRevision());
+        assertEquals(expected.storageRevision(), actual.storageRevision());
     }
 
     @Test
