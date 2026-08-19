@@ -24,20 +24,22 @@ public record CycleExecutionManifest(PlannedBatchId batchId, PlannedBatchCause c
         repetitions = SealedPatternExecution.requirePositive(repetitions, "repetitions");
         seedKey = Objects.requireNonNull(seedKey, "seedKey");
         seedAmount = SealedPatternExecution.requirePositive(seedAmount, "seedAmount");
-        memberExecutions = List.copyOf(Objects.requireNonNull(memberExecutions, "memberExecutions"));
+        Objects.requireNonNull(memberExecutions, "memberExecutions");
         if (memberExecutions.isEmpty() || memberExecutions.size() > PlannerLimits.MAX_PRODUCTIVE_CYCLE_MEMBERS) {
             throw new IllegalArgumentException("Invalid sealed cycle member count");
         }
+        memberExecutions = List.copyOf(memberExecutions);
         for (SealedPatternExecution member : memberExecutions) {
             Objects.requireNonNull(member, "memberExecutions cannot contain null");
             if (member.plannedOutputs().isEmpty()) {
                 throw new IllegalArgumentException("Sealed cycle members require planned output projections");
             }
         }
-        links = List.copyOf(Objects.requireNonNull(links, "links"));
+        Objects.requireNonNull(links, "links");
         if (links.size() != memberExecutions.size()) {
             throw new IllegalArgumentException("Sealed cycle links must match its member count");
         }
+        links = List.copyOf(links);
         finalCredits = copyCredits(finalCredits);
     }
 

@@ -35,18 +35,18 @@ public record SealedPatternExecution(CompiledPattern pattern, AEAmount execution
     }
 
     static List<PlannedInputSelection> copySelections(List<PlannedInputSelection> selections) {
-        selections = List.copyOf(Objects.requireNonNull(selections, "plannedSelections"));
+        Objects.requireNonNull(selections, "plannedSelections");
         if (selections.size() > PatternLimits.MAX_TOTAL_CANDIDATES_PER_PATTERN) {
             throw new IllegalArgumentException("Too many sealed planned selections");
         }
-        return selections;
+        return List.copyOf(selections);
     }
 
     static List<PlannedCycleOutput> copyOutputs(List<PlannedCycleOutput> outputs) {
-        outputs = List.copyOf(Objects.requireNonNull(outputs, "plannedOutputs"));
+        Objects.requireNonNull(outputs, "plannedOutputs");
         if (outputs.size() > PatternLimits.MAX_OUTPUTS) {
             throw new IllegalArgumentException("Too many sealed planned outputs");
         }
-        return outputs;
+        return List.copyOf(outputs);
     }
 }
