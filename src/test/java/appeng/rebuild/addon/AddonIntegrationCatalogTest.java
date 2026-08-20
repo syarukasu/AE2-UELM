@@ -40,7 +40,7 @@ class AddonIntegrationCatalogTest {
         assertThrows(NullPointerException.class, () -> AddonIntegrationCatalog.capabilities(null));
         assertThrows(NullPointerException.class,
                 () -> AddonIntegrationCatalog.capability(AddonId.EXTENDED_AE, null));
-        assertEquals("extendedae", AddonId.EXTENDED_AE.modId());
+        assertEquals("expatternprovider", AddonId.EXTENDED_AE.modId());
         assertEquals("advanced_ae", AddonId.ADVANCED_AE.modId());
     }
 

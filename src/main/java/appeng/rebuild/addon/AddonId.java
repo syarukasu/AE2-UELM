@@ -2,7 +2,7 @@ package appeng.rebuild.addon;
 
 /** Identifies an optional AE2 addon without loading any of its classes. */
 public enum AddonId {
-    EXTENDED_AE("extendedae"),
+    EXTENDED_AE("expatternprovider"),
     ADVANCED_AE("advanced_ae");
 
     private final String modId;
