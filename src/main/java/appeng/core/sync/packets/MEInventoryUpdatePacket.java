@@ -21,6 +21,7 @@ package appeng.core.sync.packets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -42,6 +43,8 @@ import appeng.core.sync.BasePacketHandler;
 import appeng.menu.me.common.GridInventoryEntry;
 import appeng.menu.me.common.IncrementalUpdateHelper;
 import appeng.menu.me.common.MEStorageMenu;
+import appeng.rebuild.api.exact.ExactAmountCodec;
+import appeng.rebuild.quantity.AEAmount;
 
 public class MEInventoryUpdatePacket extends BasePacket {
 
@@ -116,6 +119,17 @@ public class MEInventoryUpdatePacket extends BasePacket {
                 KeyCounter networkStorage,
                 Set<AEKey> craftables,
                 KeyCounter requestables) {
+            var exact = new java.util.HashMap<AEKey, AEAmount>();
+            for (var entry : networkStorage) {
+                exact.put(entry.getKey(), AEAmount.of(entry.getLongValue()));
+            }
+            addFull(updateHelper, exact, craftables, requestables);
+        }
+
+        public void addFull(IncrementalUpdateHelper updateHelper,
+                Map<AEKey, AEAmount> networkStorage,
+                Set<AEKey> craftables,
+                KeyCounter requestables) {
             var keys = new HashSet<AEKey>();
             keys.addAll(networkStorage.keySet());
             keys.addAll(craftables);
@@ -130,14 +144,25 @@ public class MEInventoryUpdatePacket extends BasePacket {
                 add(new GridInventoryEntry(
                         serial,
                         key,
-                        networkStorage.get(key),
-                        requestables.get(key),
+                        networkStorage.getOrDefault(key, AEAmount.ZERO),
+                        AEAmount.of(requestables.get(key)),
                         craftables.contains(key)));
             }
         }
 
         public void addChanges(IncrementalUpdateHelper updateHelper,
                 KeyCounter networkStorage,
+                Set<AEKey> craftables,
+                KeyCounter requestables) {
+            var exact = new java.util.HashMap<AEKey, AEAmount>();
+            for (var entry : networkStorage) {
+                exact.put(entry.getKey(), AEAmount.of(entry.getLongValue()));
+            }
+            addChanges(updateHelper, exact, craftables, requestables);
+        }
+
+        public void addChanges(IncrementalUpdateHelper updateHelper,
+                Map<AEKey, AEAmount> networkStorage,
                 Set<AEKey> craftables,
                 KeyCounter requestables) {
             for (AEKey key : updateHelper) {
@@ -160,15 +185,15 @@ public class MEInventoryUpdatePacket extends BasePacket {
 
                 // The queued changes are actual differences, but we need to send the real stored properties
                 // to the client.
-                var storedAmount = networkStorage.get(key);
+                var storedAmount = networkStorage.getOrDefault(key, AEAmount.ZERO);
                 var craftable = craftables.contains(key);
                 var requestable = requestables.get(key);
-                if (storedAmount <= 0 && requestable <= 0 && !craftable) {
+                if (storedAmount.equals(AEAmount.ZERO) && requestable <= 0 && !craftable) {
                     // This happens when an update is queued but the item is no longer stored
                     add(new GridInventoryEntry(serial, sendKey, 0, 0, false));
                     updateHelper.removeSerial(key);
                 } else {
-                    add(new GridInventoryEntry(serial, sendKey, storedAmount, requestable, craftable));
+                    add(new GridInventoryEntry(serial, sendKey, storedAmount, AEAmount.of(requestable), craftable));
                 }
             }
 
@@ -256,8 +281,8 @@ public class MEInventoryUpdatePacket extends BasePacket {
     private static void writeEntry(FriendlyByteBuf buffer, GridInventoryEntry entry) {
         buffer.writeVarLong(entry.getSerial());
         AEKey.writeOptionalKey(buffer, entry.getWhat());
-        buffer.writeVarLong(entry.getStoredAmount());
-        buffer.writeVarLong(entry.getRequestableAmount());
+        ExactAmountCodec.write(buffer, entry.getExactStoredAmount());
+        ExactAmountCodec.write(buffer, entry.getExactRequestableAmount());
         buffer.writeBoolean(entry.isCraftable());
     }
 
@@ -267,10 +292,18 @@ public class MEInventoryUpdatePacket extends BasePacket {
     public static GridInventoryEntry readEntry(FriendlyByteBuf buffer) {
         long serial = buffer.readVarLong();
         AEKey what = AEKey.readOptionalKey(buffer);
-        long storedAmount = buffer.readVarLong();
-        long requestableAmount = buffer.readVarLong();
+        AEAmount storedAmount = readAmount(buffer);
+        AEAmount requestableAmount = readAmount(buffer);
         boolean craftable = buffer.readBoolean();
         return new GridInventoryEntry(serial, what, storedAmount, requestableAmount, craftable);
+    }
+
+    private static AEAmount readAmount(FriendlyByteBuf buffer) {
+        var decoded = ExactAmountCodec.read(buffer);
+        if (decoded instanceof ExactAmountCodec.Success success) {
+            return success.amount();
+        }
+        throw new IllegalArgumentException("Malformed exact terminal inventory amount");
     }
 
     @Override

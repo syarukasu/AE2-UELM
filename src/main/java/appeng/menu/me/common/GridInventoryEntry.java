@@ -21,6 +21,8 @@ package appeng.menu.me.common;
 import org.jetbrains.annotations.Nullable;
 
 import appeng.api.stacks.AEKey;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * Contains information about something that is stored inside of the grid inventory. This is used to synchronize the
@@ -34,13 +36,18 @@ public class GridInventoryEntry {
     @Nullable
     private final AEKey what;
 
-    private final long storedAmount;
+    private final AEAmount storedAmount;
 
-    private final long requestableAmount;
+    private final AEAmount requestableAmount;
 
     private final boolean craftable;
 
     public GridInventoryEntry(long serial, @Nullable AEKey what, long storedAmount, long requestableAmount,
+            boolean craftable) {
+        this(serial, what, AEAmount.of(storedAmount), AEAmount.of(requestableAmount), craftable);
+    }
+
+    public GridInventoryEntry(long serial, @Nullable AEKey what, AEAmount storedAmount, AEAmount requestableAmount,
             boolean craftable) {
         this.serial = serial;
         this.what = what;
@@ -72,6 +79,10 @@ public class GridInventoryEntry {
      * How much of {@link #what} is stored in the network.
      */
     public long getStoredAmount() {
+        return LegacyAmountProjection.saturatingLong(storedAmount);
+    }
+
+    public AEAmount getExactStoredAmount() {
         return storedAmount;
     }
 
@@ -79,6 +90,10 @@ public class GridInventoryEntry {
      * How much of {@link #what} can be requested from attached external networks (i.e. logistic pipes).
      */
     public long getRequestableAmount() {
+        return LegacyAmountProjection.saturatingLong(requestableAmount);
+    }
+
+    public AEAmount getExactRequestableAmount() {
         return requestableAmount;
     }
 
@@ -93,6 +108,6 @@ public class GridInventoryEntry {
      * @return True if this entry should still be present, otherwise it's a removal.
      */
     public boolean isMeaningful() {
-        return storedAmount > 0 || requestableAmount > 0 || craftable;
+        return storedAmount.compareTo(AEAmount.ZERO) > 0 || requestableAmount.compareTo(AEAmount.ZERO) > 0 || craftable;
     }
 }

@@ -62,8 +62,8 @@ import appeng.util.prioritylist.IPartitionList;
 public class Repo implements IClientRepo {
 
     public static final Comparator<GridInventoryEntry> AMOUNT_ASC = Comparator
-            .comparingDouble((GridInventoryEntry entry) -> ((double) entry.getStoredAmount())
-                    / ((double) entry.getWhat().getAmountPerUnit()));
+            .comparing((GridInventoryEntry entry) -> entry.getExactStoredAmount().toBigInteger()
+                    .divide(java.math.BigInteger.valueOf(entry.getWhat().getAmountPerUnit())));
 
     public static final Comparator<GridInventoryEntry> AMOUNT_DESC = AMOUNT_ASC.reversed();
 
@@ -227,7 +227,8 @@ public class Repo implements IClientRepo {
                 continue;
             }
 
-            if (viewMode == ViewItems.STORED && entry.getStoredAmount() == 0) {
+            if (viewMode == ViewItems.STORED
+                    && entry.getExactStoredAmount().equals(appeng.rebuild.quantity.AEAmount.ZERO)) {
                 continue;
             }
 
