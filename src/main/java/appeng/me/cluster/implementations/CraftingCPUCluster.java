@@ -55,6 +55,7 @@ import appeng.api.stacks.KeyCounter;
 import appeng.api.util.IConfigManager;
 import appeng.blockentity.crafting.CraftingBlockEntity;
 import appeng.blockentity.crafting.CraftingMonitorBlockEntity;
+import appeng.blockentity.crafting.MolecularAssemblerBlockEntity;
 import appeng.core.AELog;
 import appeng.core.sync.network.NetworkHandler;
 import appeng.core.sync.packets.CraftingJobStatusPacket;
@@ -71,12 +72,14 @@ import appeng.rebuild.execution.CurrentPatternSnapshotSource;
 import appeng.rebuild.execution.ExactCpuExecutionSession;
 import appeng.rebuild.execution.ExactCpuLedgerState;
 import appeng.rebuild.execution.ExactCraftingPlan;
+import appeng.rebuild.execution.ExactCraftingProvider;
 import appeng.rebuild.execution.ExactRecoveryActivation;
 import appeng.rebuild.execution.ExactRecoveryCheckpoint;
 import appeng.rebuild.execution.ExactTransferBrokerState;
 import appeng.rebuild.execution.ExactWorkCommand;
 import appeng.rebuild.execution.ExactWorkOrderCommandResult;
 import appeng.rebuild.execution.ExactWorkOrderState;
+import appeng.rebuild.execution.WorkCommandId;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
 import appeng.rebuild.quantity.AEAmount;
@@ -285,7 +288,9 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             exactDispatching = true;
             boolean pushed;
             try {
-                pushed = provider.pushPattern(binding.details(), inputs);
+                pushed = provider instanceof ExactCraftingProvider exactProvider
+                        ? exactProvider.pushExactPattern(command, binding.details(), inputs)
+                        : provider.pushPattern(binding.details(), inputs);
             } catch (RuntimeException providerFailure) {
                 if (exactOutputObserved) {
                     exactSession.acceptIssued(command);
@@ -330,6 +335,48 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
 
     public boolean isExactCommandInFlight(ExactWorkCommand command) {
         return exactInFlight != null && exactInFlight.equals(command);
+    }
+
+    /** Atomically transfers one identity-bound native machine result into exact work-order custody. */
+    public boolean completeExactMachineCommand(WorkCommandId commandId, Map<AEKey, AEAmount> outputs,
+            Map<AEKey, AEAmount> remainders) {
+        requireExactServerThread();
+        ExactWorkCommand command = exactInFlight;
+        KeyRegistry keys = exactKeyRegistry();
+        if (command == null || keys == null || !command.id().equals(commandId)) {
+            return false;
+        }
+        Map<KeyId, AEAmount> keyedOutputs = exactResultMap(keys, outputs);
+        Map<KeyId, AEAmount> keyedRemainders = exactResultMap(keys, remainders);
+        if (keyedOutputs == null || keyedRemainders == null) {
+            return false;
+        }
+        var result = exactSession.completeIssued(command, keyedOutputs, keyedRemainders);
+        if (!(result instanceof ExactCpuExecutionSession.Transition transition)
+                || !(transition
+                        .result() instanceof appeng.rebuild.execution.ExactWorkOrderTransitionResult.Completed)) {
+            return false;
+        }
+        clearStagedExactCommand();
+        markDirty();
+        return true;
+    }
+
+    private static @Nullable Map<KeyId, AEAmount> exactResultMap(KeyRegistry keys, Map<AEKey, AEAmount> amounts) {
+        if (amounts == null || amounts.size() > appeng.rebuild.planner.PlannerLimits.MAX_STORAGE_SNAPSHOT_KEYS) {
+            return null;
+        }
+        Map<KeyId, AEAmount> result = new HashMap<>();
+        for (var entry : amounts.entrySet()) {
+            if (entry.getKey() == null || entry.getValue() == null || entry.getValue().equals(AEAmount.ZERO)) {
+                return null;
+            }
+            KeyId id = keys.lookup(entry.getKey());
+            if (id == null || result.put(id, entry.getValue()) != null) {
+                return null;
+            }
+        }
+        return Map.copyOf(result);
     }
 
     /** Discards only a plan which has not acquired physical custody. */
@@ -714,13 +761,36 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
         if (checkpoint == null) {
             return new ExactCpuExecutionSession.Rejected(ExactRecoveryActivation.Reason.INVALID_CHECKPOINT);
         }
-        ExactCpuExecutionSession.ActivationResult result = ExactCpuExecutionSession.activate(checkpoint, storage,
-                patterns, this::isExactServerThread, source, this::replaceExactRecovery, this::clearExactRecovery);
+        ExactWorkCommand confirmedCommand = findRetainedNativeCommand(checkpoint);
+        ExactCpuExecutionSession.ActivationResult result = confirmedCommand == null
+                ? ExactCpuExecutionSession.activate(checkpoint, storage, patterns, this::isExactServerThread, source,
+                        this::replaceExactRecovery, this::clearExactRecovery)
+                : ExactCpuExecutionSession.activateConfirmedInFlight(checkpoint, confirmedCommand.id(), storage,
+                        patterns, this::isExactServerThread, source, this::replaceExactRecovery,
+                        this::clearExactRecovery);
         if (result instanceof ExactCpuExecutionSession.Activated activated) {
             this.exactSession = activated.session();
+            if (confirmedCommand != null) {
+                stageExactCommand(confirmedCommand);
+            }
             this.exactRecovery.markActivated();
         }
         return result;
+    }
+
+    private @Nullable ExactWorkCommand findRetainedNativeCommand(ExactRecoveryCheckpoint checkpoint) {
+        ExactWorkCommand command = checkpoint.workOrder().flatMap(order -> order.inFlightCommand()).orElse(null);
+        IGrid grid = getGrid();
+        if (command == null || grid == null) {
+            return null;
+        }
+        int matches = 0;
+        for (MolecularAssemblerBlockEntity assembler : grid.getMachines(MolecularAssemblerBlockEntity.class)) {
+            if (assembler.retainsExactCommand(command.id()) && ++matches > 1) {
+                return null;
+            }
+        }
+        return matches == 1 ? command : null;
     }
 
     /** True when native NBT contains a decoded inert exact checkpoint awaiting this grid's activation. */

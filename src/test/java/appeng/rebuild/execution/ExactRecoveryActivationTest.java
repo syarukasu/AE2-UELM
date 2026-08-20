@@ -175,6 +175,28 @@ class ExactRecoveryActivationTest {
     }
 
     @Test
+    void identityConfirmedNativeCommandRestoresInFlightWithoutReissue() {
+        Fixture fixture = fixture(AEAmount.ONE);
+        Handoff handoff = handoff(fixture);
+        ExactWorkCommand command = assertInstanceOf(ExactWorkOrderCommandResult.Issued.class,
+                handoff.order.issueNext(Long.MAX_VALUE)).command();
+        assertInstanceOf(ExactWorkOrderTransitionResult.Accepted.class,
+                handoff.order.accept(new WorkCommandAcceptance(command)));
+        ExactRecoveryCheckpoint checkpoint = new ExactRecoveryCheckpoint(fixture.plan(), handoff.ledger.snapshot(),
+                handoff.broker.snapshot(), Optional.of(handoff.order.snapshot()), true);
+        WorkCommandId wrong = new WorkCommandId(command.id().planId(), command.id().leaseIdentity(),
+                command.id().workOrderId(), command.id().generation() + 1L);
+
+        assertRecoveryRequired(new ExactRecoveryActivation().activateConfirmedInFlight(checkpoint, handoff.storage,
+                handoff.patterns, handoff.gate, SOURCE, wrong), checkpoint);
+        ExactRecoveryActivation.Activated activated = assertInstanceOf(ExactRecoveryActivation.Activated.class,
+                new ExactRecoveryActivation().activateConfirmedInFlight(checkpoint, handoff.storage, handoff.patterns,
+                        handoff.gate, SOURCE, command.id()));
+        assertEquals(Optional.of(command), activated.workOrder().orElseThrow().snapshot().inFlightCommand());
+        assertEquals(ExactWorkOrderState.IN_FLIGHT, activated.workOrder().orElseThrow().snapshot().state());
+    }
+
+    @Test
     void brokerDiscrepancyFailedHandoffAndWorkOrderTransferDiscrepancyNeverAutoResume() {
         Fixture fixture = fixture(AEAmount.ONE);
         CountingStorage storage = new CountingStorage(fixture.storage());

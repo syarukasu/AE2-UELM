@@ -100,6 +100,18 @@ public final class ExactWorkOrder {
     static ExactWorkOrder restoreFromRecovery(ExactWorkOrderSnapshot recovered, ReservedPlanLease lease,
             BrokerExactStorage storage, ServerThreadGate serverThread, IActionSource actionSource,
             ExactCpuLedger ledger, ExactTransferBroker ownerBroker) {
+        return restoreFromRecovery(recovered, lease, storage, serverThread, actionSource, ledger, ownerBroker, false);
+    }
+
+    static ExactWorkOrder restoreConfirmedInFlightFromRecovery(ExactWorkOrderSnapshot recovered,
+            ReservedPlanLease lease, BrokerExactStorage storage, ServerThreadGate serverThread,
+            IActionSource actionSource, ExactCpuLedger ledger, ExactTransferBroker ownerBroker) {
+        return restoreFromRecovery(recovered, lease, storage, serverThread, actionSource, ledger, ownerBroker, true);
+    }
+
+    private static ExactWorkOrder restoreFromRecovery(ExactWorkOrderSnapshot recovered, ReservedPlanLease lease,
+            BrokerExactStorage storage, ServerThreadGate serverThread, IActionSource actionSource,
+            ExactCpuLedger ledger, ExactTransferBroker ownerBroker, boolean confirmedInFlight) {
         Objects.requireNonNull(recovered, "recovered");
         Objects.requireNonNull(lease, "lease");
         if (!recovered.planId().equals(lease.planId()) || !recovered.handle().equals(lease.handle())
@@ -107,11 +119,16 @@ public final class ExactWorkOrder {
                 || !recovered.leaseIdentity().equals(lease.leaseIdentity())) {
             throw new IllegalArgumentException("Recovery work order differs from its sealed lease");
         }
-        if (recovered.inFlightCommand().isPresent() || recovered.discrepancy().isPresent()
+        if ((!confirmedInFlight && recovered.inFlightCommand().isPresent()) || recovered.discrepancy().isPresent()
                 || recovered.completedEvidence().isPresent() || recovered.transferDiscrepancy().isPresent()
                 || recovered.state() == ExactWorkOrderState.FAIL_CLOSED
-                || recovered.state() == ExactWorkOrderState.CANCEL_PENDING) {
+                || (!confirmedInFlight && recovered.state() == ExactWorkOrderState.CANCEL_PENDING)) {
             throw new IllegalArgumentException("Ambiguous work-order evidence cannot be activated");
+        }
+        if (confirmedInFlight && (recovered.inFlightCommand().isEmpty()
+                || (recovered.state() != ExactWorkOrderState.IN_FLIGHT
+                        && recovered.state() != ExactWorkOrderState.CANCEL_PENDING))) {
+            throw new IllegalArgumentException("Confirmed recovery requires one retained in-flight command");
         }
         ExactWorkOrder result = new ExactWorkOrder(recovered.workOrderId(), lease, lease.reservedDebits(), storage,
                 serverThread, actionSource, ledger, ownerBroker);
@@ -129,11 +146,15 @@ public final class ExactWorkOrder {
         result.nextGeneration = recovered.nextGeneration();
         result.generationExhausted = recovered.generationExhausted();
         result.outstanding = recovered.outstandingCommand().map(result::recoveryIssued).orElse(null);
+        result.inFlight = recovered.inFlightCommand().map(result::recoveryIssued).orElse(null);
         if (result.state == ExactWorkOrderState.COMMAND_OUTSTANDING && result.outstanding == null) {
             throw new IllegalArgumentException("Outstanding recovery work order lacks command");
         }
         if (result.state != ExactWorkOrderState.COMMAND_OUTSTANDING && result.outstanding != null) {
             throw new IllegalArgumentException("Recovery command does not match work-order state");
+        }
+        if (confirmedInFlight && result.inFlight == null) {
+            throw new IllegalArgumentException("Confirmed recovery lost its in-flight command");
         }
         // Constructing a detached snapshot is a final, pure shape check before this object becomes reachable.
         if (!result.snapshot().equals(recovered)) {

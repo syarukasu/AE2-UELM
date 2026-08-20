@@ -78,6 +78,9 @@ import appeng.crafting.pattern.AESmithingTablePattern;
 import appeng.crafting.pattern.AEStonecuttingPattern;
 import appeng.helpers.InterfaceLogicHost;
 import appeng.me.helpers.MachineSource;
+import appeng.rebuild.execution.ExactCraftingMachine;
+import appeng.rebuild.execution.ExactCraftingProvider;
+import appeng.rebuild.execution.ExactWorkCommand;
 import appeng.rebuild.pattern.PatternLimits;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadFailure;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadResult;
@@ -91,7 +94,7 @@ import appeng.util.inv.PlayerInternalInventory;
 /**
  * Shared code between the pattern provider block and part.
  */
-public class PatternProviderLogic implements InternalInventoryHost, ICraftingProvider {
+public class PatternProviderLogic implements InternalInventoryHost, ICraftingProvider, ExactCraftingProvider {
     private static final Logger LOGGER = LoggerFactory.getLogger(PatternProviderLogic.class);
 
     public static final String NBT_MEMORY_CARD_PATTERNS = "patterns";
@@ -575,6 +578,29 @@ public class PatternProviderLogic implements InternalInventoryHost, ICraftingPro
         }
 
         return false;
+    }
+
+    @Override
+    public boolean pushExactPattern(ExactWorkCommand command, IPatternDetails patternDetails,
+            KeyCounter[] inputHolder) {
+        Objects.requireNonNull(command, "command");
+        if (!sendList.isEmpty() || !this.mainNode.isActive() || !this.patterns.contains(patternDetails)
+                || getCraftingLockedReason() != LockCraftingMode.NONE) {
+            return false;
+        }
+        var be = host.getBlockEntity();
+        var level = be.getLevel();
+        for (var direction : getActiveSides()) {
+            var adjPos = be.getBlockPos().relative(direction);
+            var adjBeSide = direction.getOpposite();
+            var craftingMachine = ICraftingMachine.of(level, adjPos, adjBeSide, level.getBlockEntity(adjPos));
+            if (craftingMachine instanceof ExactCraftingMachine exactMachine && craftingMachine.acceptsPlans()
+                    && exactMachine.pushExactPattern(command, patternDetails, inputHolder, adjBeSide)) {
+                onPushPatternSuccess(patternDetails);
+                return true;
+            }
+        }
+        return pushPattern(patternDetails, inputHolder);
     }
 
     public void resetCraftingLock() {

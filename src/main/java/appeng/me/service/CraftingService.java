@@ -88,6 +88,7 @@ import appeng.rebuild.execution.ExactCraftingPlanValidator;
 import appeng.rebuild.execution.ExactPlanValidationResult;
 import appeng.rebuild.execution.ExactTransferBrokerState;
 import appeng.rebuild.execution.ExactWorkCommand;
+import appeng.rebuild.execution.WorkCommandId;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.pattern.CompiledPattern;
 import appeng.rebuild.pattern.GraphGeneration;
@@ -396,6 +397,44 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         if (exactCommandRoute != null && exactCommandRoute.cpu == cpu && exactCommandRoute.command.equals(command)) {
             exactCommandRoute = null;
         }
+    }
+
+    /** Routes a native machine result only to the exact command whose durable identity it carries. */
+    public long insertExactCommandResult(WorkCommandId commandId, AEKey what, long amount, Actionable mode) {
+        if (commandId == null || what == null || amount <= 0 || mode == null) {
+            return 0;
+        }
+        ExactCommandRoute route = exactCommandRoute;
+        if (route == null || !route.command.id().equals(commandId)
+                || !route.cpu.isExactCommandInFlight(route.command)) {
+            return 0;
+        }
+        long accepted = route.cpu.insert(what, amount, mode, route.cpu.getSrc());
+        if (!route.cpu.isExactCommandInFlight(route.command)) {
+            exactCommandRoute = null;
+        }
+        return accepted;
+    }
+
+    public boolean isExactCommandActive(WorkCommandId commandId) {
+        ExactCommandRoute route = exactCommandRoute;
+        return commandId != null && route != null && route.command.id().equals(commandId)
+                && route.cpu.isExactCommandInFlight(route.command);
+    }
+
+    /** Completes a native machine command as one identity-bound physical result transaction. */
+    public boolean completeExactCommandResult(WorkCommandId commandId, Map<AEKey, AEAmount> outputs,
+            Map<AEKey, AEAmount> remainders) {
+        ExactCommandRoute route = exactCommandRoute;
+        if (commandId == null || route == null || !route.command.id().equals(commandId)
+                || !route.cpu.isExactCommandInFlight(route.command)) {
+            return false;
+        }
+        boolean completed = route.cpu.completeExactMachineCommand(commandId, outputs, remainders);
+        if (completed || !route.cpu.isExactCommandInFlight(route.command)) {
+            exactCommandRoute = null;
+        }
+        return completed;
     }
 
     @Override

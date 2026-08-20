@@ -32,6 +32,20 @@ public final class ExactRecoveryActivation {
      */
     public synchronized Result activate(ExactRecoveryCheckpoint checkpoint, BrokerExactStorage storage,
             CurrentPatternSnapshotSource patternSnapshots, ServerThreadGate serverThread, IActionSource actionSource) {
+        return activate(checkpoint, storage, patternSnapshots, serverThread, actionSource, null);
+    }
+
+    /** Activates one in-flight command only after its native executor proved the same durable identity is retained. */
+    public synchronized Result activateConfirmedInFlight(ExactRecoveryCheckpoint checkpoint, BrokerExactStorage storage,
+            CurrentPatternSnapshotSource patternSnapshots, ServerThreadGate serverThread, IActionSource actionSource,
+            WorkCommandId confirmedCommand) {
+        return activate(checkpoint, storage, patternSnapshots, serverThread, actionSource,
+                Objects.requireNonNull(confirmedCommand, "confirmedCommand"));
+    }
+
+    private Result activate(ExactRecoveryCheckpoint checkpoint, BrokerExactStorage storage,
+            CurrentPatternSnapshotSource patternSnapshots, ServerThreadGate serverThread, IActionSource actionSource,
+            WorkCommandId confirmedCommand) {
         if (serverThread == null) {
             return new Rejected(Reason.MALFORMED_ARGUMENT);
         }
@@ -46,7 +60,7 @@ public final class ExactRecoveryActivation {
             if (checkpoint == null || storage == null || patternSnapshots == null || actionSource == null) {
                 return new Rejected(Reason.MALFORMED_ARGUMENT);
             }
-            if (checkpoint.recoveryRequired()) {
+            if (checkpoint.recoveryRequired() && !isConfirmedNativeInFlight(checkpoint, confirmedCommand)) {
                 return new RecoveryRequired(checkpoint, Reason.AMBIGUOUS_PHYSICAL_STATE);
             }
             if (isUnreachableCompletedHandoff(checkpoint)) {
@@ -62,8 +76,11 @@ public final class ExactRecoveryActivation {
                     if (lease == null) {
                         throw new IllegalArgumentException("Work-order recovery has no handed-off lease");
                     }
-                    return ExactWorkOrder.restoreFromRecovery(snapshot, lease, storage, serverThread, actionSource,
-                            ledger, broker);
+                    return confirmedCommand == null
+                            ? ExactWorkOrder.restoreFromRecovery(snapshot, lease, storage, serverThread, actionSource,
+                                    ledger, broker)
+                            : ExactWorkOrder.restoreConfirmedInFlightFromRecovery(snapshot, lease, storage,
+                                    serverThread, actionSource, ledger, broker);
                 });
                 // A final detached observation check proves that all reconstructed identities and quantities match the
                 // checkpoint before any live object is published to the caller.
@@ -87,6 +104,23 @@ public final class ExactRecoveryActivation {
         } finally {
             entered = false;
         }
+    }
+
+    private static boolean isConfirmedNativeInFlight(ExactRecoveryCheckpoint checkpoint,
+            WorkCommandId confirmedCommand) {
+        if (checkpoint == null || confirmedCommand == null || checkpoint.failedHandoff().isPresent()
+                || checkpoint.broker().state() != ExactTransferBrokerState.LEASED
+                || checkpoint.broker().transferDiscrepancy().isPresent()) {
+            return false;
+        }
+        ExactWorkOrderSnapshot order = checkpoint.workOrder().orElse(null);
+        if (order == null || (order.state() != ExactWorkOrderState.IN_FLIGHT
+                && order.state() != ExactWorkOrderState.CANCEL_PENDING)
+                || order.discrepancy().isPresent() || order.completedEvidence().isPresent()
+                || order.transferDiscrepancy().isPresent()) {
+            return false;
+        }
+        return order.inFlightCommand().map(ExactWorkCommand::id).filter(confirmedCommand::equals).isPresent();
     }
 
     private static boolean onServerThread(ServerThreadGate serverThread) {

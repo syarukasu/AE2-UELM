@@ -66,6 +66,25 @@ public final class ExactCpuExecutionSession {
         return new Rejected(((ExactRecoveryActivation.Rejected) result).reason());
     }
 
+    /** Activates a command retained by one identity-aware native executor without reissuing it. */
+    public static ActivationResult activateConfirmedInFlight(ExactRecoveryCheckpoint checkpoint,
+            WorkCommandId confirmedCommand, BrokerExactStorage storage, CurrentPatternSnapshotSource patterns,
+            ServerThreadGate serverThread, IActionSource actionSource,
+            Consumer<ExactRecoveryCheckpoint> checkpointPublisher, Runnable checkpointClearer) {
+        ExactRecoveryActivation.Result result = new ExactRecoveryActivation().activateConfirmedInFlight(checkpoint,
+                storage, patterns, serverThread, actionSource, confirmedCommand);
+        if (result instanceof ExactRecoveryActivation.Activated activated) {
+            ExactCpuExecutionSession session = new ExactCpuExecutionSession(activated.ledger(), activated.broker(),
+                    activated.workOrder(), checkpointPublisher, checkpointClearer);
+            session.publishDurableCheckpoint();
+            return new Activated(session, session.snapshot());
+        }
+        if (result instanceof ExactRecoveryActivation.RecoveryRequired required) {
+            return new RecoveryRequired(required.reason());
+        }
+        return new Rejected(((ExactRecoveryActivation.Rejected) result).reason());
+    }
+
     public ExactCpuSessionResult prepare(ExactCraftingPlan plan) {
         ExactCpuLedgerResult result = ledger.prepare(plan);
         publishIfDurable();
