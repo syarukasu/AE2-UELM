@@ -5,6 +5,7 @@ package appeng.rebuild.addon;
  */
 public enum AddonSurface {
     PATTERN_PROVIDER(ExactRebuildSeam.NORMALIZED_PATTERN_SNAPSHOT),
+    CRAFTING_MACHINE(ExactRebuildSeam.SEALED_EXACT_COMMAND),
     STORAGE(ExactRebuildSeam.EXACT_STORAGE_SNAPSHOT),
     CPU(ExactRebuildSeam.EXACT_CPU_LEDGER);
 

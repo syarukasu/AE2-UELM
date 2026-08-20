@@ -14,16 +14,12 @@ import appeng.api.crafting.IPatternDetails.IInput;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
-import appeng.crafting.pattern.AECraftingPattern;
-import appeng.crafting.pattern.AEProcessingPattern;
-import appeng.crafting.pattern.AESmithingTablePattern;
-import appeng.crafting.pattern.AEStonecuttingPattern;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
 import appeng.rebuild.quantity.AEAmount;
 
 /**
- * Server-thread-confined normalizer for AE2's four built-in legacy pattern implementations.
+ * Server-thread-confined normalizer for AE2's standard pattern implementations and compatible addon subclasses.
  *
  * <p>
  * Each normalization confirms the supplied level's server thread before it reads legacy state, then fully validates
@@ -55,7 +51,7 @@ public final class LegacyPatternNormalizer {
         Objects.requireNonNull(recipeRevision, "recipeRevision");
         assertServerThread(level);
 
-        PatternKind kind = patternKind(details);
+        PatternKind kind = RebuildPatternClassifier.classify(details);
         if (kind == null) {
             return failure(PatternNormalizationResult.FailureReason.UNSUPPORTED_PATTERN, "pattern-type");
         }
@@ -203,22 +199,6 @@ public final class LegacyPatternNormalizer {
         }
         return new CompiledPattern(definition.id(), definition.kind(), inputs, outputs, definition.machineIntent(),
                 definition.revision(), keyRegistry.generation());
-    }
-
-    private static PatternKind patternKind(IPatternDetails details) {
-        if (details.getClass() == AECraftingPattern.class) {
-            return PatternKind.CRAFTING;
-        }
-        if (details.getClass() == AEProcessingPattern.class) {
-            return PatternKind.PROCESSING;
-        }
-        if (details.getClass() == AESmithingTablePattern.class) {
-            return PatternKind.SMITHING;
-        }
-        if (details.getClass() == AEStonecuttingPattern.class) {
-            return PatternKind.STONECUTTING;
-        }
-        return null;
     }
 
     private static void assertServerThread(Level level) {

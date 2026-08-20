@@ -67,6 +67,7 @@ import appeng.me.cluster.MBCalculator;
 import appeng.me.helpers.MachineSource;
 import appeng.me.service.CraftingService;
 import appeng.me.service.StorageService;
+import appeng.rebuild.addon.StandardAddonMachineExactAdapter;
 import appeng.rebuild.api.legacy.LegacyAmountProjection;
 import appeng.rebuild.execution.CurrentPatternSnapshotSource;
 import appeng.rebuild.execution.ExactCpuExecutionSession;
@@ -290,7 +291,7 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             try {
                 pushed = provider instanceof ExactCraftingProvider exactProvider
                         ? exactProvider.pushExactPattern(command, binding.details(), inputs)
-                        : provider.pushPattern(binding.details(), inputs);
+                        : StandardAddonMachineExactAdapter.pushPattern(provider, binding.details(), inputs);
             } catch (RuntimeException providerFailure) {
                 if (exactOutputObserved) {
                     exactSession.acceptIssued(command);

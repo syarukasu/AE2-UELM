@@ -718,6 +718,22 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             return CraftingSubmitResult.INCOMPLETE_PLAN;
         }
 
+        if (job instanceof ExactCraftingPlanAdapter exact) {
+            CraftingCPUCluster exactCpu;
+            if (target instanceof CraftingCPUCluster standardCpu) {
+                exactCpu = standardCpu;
+            } else {
+                var unsuitableCpusResult = new MutableObject<UnsuitableCpus>();
+                exactCpu = findSuitableExactCraftingCPU(job, prioritizePower, src, unsuitableCpusResult);
+                if (exactCpu == null) {
+                    var unsuitableCpus = unsuitableCpusResult.getValue();
+                    return unsuitableCpus == null ? CraftingSubmitResult.NO_CPU_FOUND
+                            : CraftingSubmitResult.noSuitableCpu(unsuitableCpus);
+                }
+            }
+            return submitExact(exactCpu, exact, requestingMachine, src);
+        }
+
         CraftingCPUCluster cpuCluster;
 
         if (target instanceof CraftingCPUCluster) {
@@ -736,10 +752,16 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             }
         }
 
-        if (job instanceof ExactCraftingPlanAdapter exact) {
-            return submitExact(cpuCluster, exact, requestingMachine, src);
-        }
         return cpuCluster.submitJob(this.grid, job, src, requestingMachine);
+    }
+
+    /**
+     * Keeps exact CPU selection outside addon injections into legacy {@link #submitJob}. Addon machines remain valid
+     * physical targets, but a long-authoritative addon CPU cannot consume an exact plan.
+     */
+    private CraftingCPUCluster findSuitableExactCraftingCPU(ICraftingPlan job, boolean prioritizePower,
+            IActionSource source, MutableObject<UnsuitableCpus> unsuitableCpus) {
+        return findSuitableCraftingCPU(job, prioritizePower, source, unsuitableCpus);
     }
 
     private ICraftingSubmitResult submitExact(CraftingCPUCluster cpu, ExactCraftingPlanAdapter plan,

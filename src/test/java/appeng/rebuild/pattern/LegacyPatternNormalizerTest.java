@@ -89,6 +89,11 @@ class LegacyPatternNormalizerTest {
     }
 
     @Test
+    void addonSubclassUsesItsStandardAe2PatternContract() {
+        assertEquals(PatternKind.PROCESSING, normalizeKind(AddonProcessingPattern.class));
+    }
+
+    @Test
     void preservesExactAmountsMultiplierFilteringOrderRemainderAndPrimaryOutputs() {
         Fixture fixture = fixture(AECraftingPattern.class);
         AEKey first = fixture.firstKey;
@@ -253,5 +258,11 @@ class LegacyPatternNormalizerTest {
     private record Fixture(LegacyPatternNormalizer normalizer, IPatternDetails details, Level level,
             MinecraftServer server, AEItemKey definition, IInput input, KeyRegistry registry, AEKey firstKey,
             AEKey filteredKey, AEKey secondKey, AEKey remainderKey, AEKey outputKey) {
+    }
+
+    private static class AddonProcessingPattern extends AEProcessingPattern {
+        AddonProcessingPattern(AEItemKey definition) {
+            super(definition);
+        }
     }
 }

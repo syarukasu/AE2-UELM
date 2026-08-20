@@ -9,6 +9,7 @@ package appeng.rebuild.addon;
  */
 public enum ExactRebuildSeam {
     NORMALIZED_PATTERN_SNAPSHOT,
+    SEALED_EXACT_COMMAND,
     EXACT_STORAGE_SNAPSHOT,
     EXACT_CPU_LEDGER
 }

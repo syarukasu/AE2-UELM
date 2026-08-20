@@ -72,10 +72,6 @@ import appeng.core.definitions.AEItems;
 import appeng.core.localization.GuiText;
 import appeng.core.localization.PlayerMessages;
 import appeng.core.settings.TickRates;
-import appeng.crafting.pattern.AECraftingPattern;
-import appeng.crafting.pattern.AEProcessingPattern;
-import appeng.crafting.pattern.AESmithingTablePattern;
-import appeng.crafting.pattern.AEStonecuttingPattern;
 import appeng.helpers.InterfaceLogicHost;
 import appeng.me.helpers.MachineSource;
 import appeng.rebuild.execution.ExactCraftingMachine;
@@ -85,6 +81,7 @@ import appeng.rebuild.pattern.PatternLimits;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadFailure;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadResult;
 import appeng.rebuild.pattern.PreparedPatternProviderRecipeReload;
+import appeng.rebuild.pattern.RebuildPatternClassifier;
 import appeng.rebuild.pattern.RecipeRevision;
 import appeng.util.ConfigManager;
 import appeng.util.inv.AppEngInternalInventory;
@@ -424,10 +421,7 @@ public class PatternProviderLogic implements InternalInventoryHost, ICraftingPro
     }
 
     private static boolean isRebuildEligible(IPatternDetails details) {
-        Class<?> type = details.getClass();
-        return type == AECraftingPattern.class || type == AEProcessingPattern.class
-                || type == AESmithingTablePattern.class
-                || type == AEStonecuttingPattern.class;
+        return RebuildPatternClassifier.isEligible(details);
     }
 
     private ServerLevel requireServerLevel() {

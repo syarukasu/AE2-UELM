@@ -28,10 +28,6 @@ import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
 import appeng.api.storage.AEKeyFilter;
-import appeng.crafting.pattern.AECraftingPattern;
-import appeng.crafting.pattern.AEProcessingPattern;
-import appeng.crafting.pattern.AESmithingTablePattern;
-import appeng.crafting.pattern.AEStonecuttingPattern;
 import appeng.helpers.patternprovider.PatternProviderLogic;
 import appeng.hooks.ticking.TickHandler;
 import appeng.rebuild.pattern.CompiledPattern;
@@ -53,6 +49,7 @@ import appeng.rebuild.pattern.PatternProviderRecipeReloadFailure;
 import appeng.rebuild.pattern.PatternProviderRecipeReloadResult;
 import appeng.rebuild.pattern.PatternRevision;
 import appeng.rebuild.pattern.PreparedPatternProviderRecipeReload;
+import appeng.rebuild.pattern.RebuildPatternClassifier;
 import appeng.rebuild.pattern.RecipeRevision;
 
 /**
@@ -214,9 +211,30 @@ public class NetworkCraftingProviders {
         try {
             for (ProviderSnapshot state : providerSnapshot) {
                 if (!(state.provider() instanceof PatternProviderLogic providerLogic)) {
-                    hasLegacyFallback = true;
-                    if (!addFallbackDiagnostic(diagnostics, "non-pattern-provider")) {
-                        return failure(NormalizedPatternBuildResult.FailureReason.DIAGNOSTIC_LIMIT, "diagnostics");
+                    for (IPatternDetails details : state.patterns()) {
+                        if (inspectedBindings >= PatternLimits.MAX_NORMALIZED_PATTERN_BINDINGS_PER_GRID) {
+                            return failure(NormalizedPatternBuildResult.FailureReason.GRID_LIMIT, "pattern-bindings");
+                        }
+                        inspectedBindings++;
+                        if (!RebuildPatternClassifier.isEligible(details)) {
+                            hasLegacyFallback = true;
+                            if (!addFallbackDiagnostic(diagnostics, "custom-pattern")) {
+                                return failure(NormalizedPatternBuildResult.FailureReason.DIAGNOSTIC_LIMIT,
+                                        "diagnostics");
+                            }
+                            continue;
+                        }
+                        Level level = state.node().getLevel();
+                        if (level == null) {
+                            return failure(NormalizedPatternBuildResult.FailureReason.SERVER_CONTEXT,
+                                    "provider-level");
+                        }
+                        PatternId previewId = previewPatternId(details);
+                        if (previewId == null) {
+                            return failure(NormalizedPatternBuildResult.FailureReason.NORMALIZATION_FAILURE,
+                                    "pattern-identity");
+                        }
+                        eligibleBindings.add(new PreparedBinding(previewId, details, level, state.priority()));
                     }
                     continue;
                 }
@@ -322,7 +340,7 @@ public class NetworkCraftingProviders {
 
     @Nullable
     private static PatternId previewPatternId(IPatternDetails details) {
-        PatternKind kind = patternKind(details);
+        PatternKind kind = RebuildPatternClassifier.classify(details);
         if (kind == null) {
             return null;
         }
@@ -334,25 +352,10 @@ public class NetworkCraftingProviders {
         return result instanceof PatternIdCreationResult.Success success ? success.patternId() : null;
     }
 
-    @Nullable
-    private static PatternKind patternKind(IPatternDetails details) {
-        Class<?> type = details.getClass();
-        if (type == AECraftingPattern.class) {
-            return PatternKind.CRAFTING;
-        }
-        if (type == AEProcessingPattern.class) {
-            return PatternKind.PROCESSING;
-        }
-        if (type == AESmithingTablePattern.class) {
-            return PatternKind.SMITHING;
-        }
-        return type == AEStonecuttingPattern.class ? PatternKind.STONECUTTING : null;
-    }
-
     private List<ProviderSnapshot> snapshotProviderStates() {
         List<ProviderSnapshot> snapshot = new ArrayList<>(craftingProviders.size());
         for (ProviderState state : craftingProviders.values()) {
-            snapshot.add(new ProviderSnapshot(state.node, state.provider, state.priority));
+            snapshot.add(new ProviderSnapshot(state.node, state.provider, state.patterns, state.priority));
         }
         return List.copyOf(snapshot);
     }
@@ -439,10 +442,16 @@ public class NetworkCraftingProviders {
         }
     }
 
-    private record ProviderSnapshot(IGridNode node, ICraftingProvider provider, int priority) {
+    private record ProviderSnapshot(IGridNode node, ICraftingProvider provider, List<IPatternDetails> patterns,
+            int priority) {
         private ProviderSnapshot {
             Objects.requireNonNull(node, "node");
             Objects.requireNonNull(provider, "provider");
+            Objects.requireNonNull(patterns, "patterns");
+            if (patterns.size() > PatternLimits.MAX_PATTERN_PROVIDER_PATTERNS) {
+                throw new IllegalArgumentException("Too many provider patterns");
+            }
+            patterns = List.copyOf(patterns);
         }
     }
 

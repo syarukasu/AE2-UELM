@@ -1,6 +1,7 @@
 package appeng.rebuild.pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -123,7 +124,7 @@ class NetworkCraftingProvidersNormalizedShadowTest {
     }
 
     @Test
-    void genericProviderUsesLegacyFallbackAndDoesNotNormalize() {
+    void genericProviderCustomContractUsesLegacyFallbackAndDoesNotNormalize() {
         NetworkCraftingProviders providers = new NetworkCraftingProviders();
         ICraftingProvider generic = genericProvider();
         IPatternDetails details = mock(IPatternDetails.class);
@@ -139,10 +140,33 @@ class NetworkCraftingProvidersNormalizedShadowTest {
 
         assertTrue(success.snapshot().hasLegacyFallback());
         assertEquals(List.of(new NormalizedPatternDiagnostic(
-                NormalizedPatternDiagnostic.Reason.LEGACY_FALLBACK, "non-pattern-provider")),
+                NormalizedPatternDiagnostic.Reason.LEGACY_FALLBACK, "custom-pattern")),
                 success.snapshot().diagnostics());
         assertTrue(success.snapshot().patternsById().isEmpty());
         verify(normalizer, never()).normalize(any(), any(), any());
+    }
+
+    @Test
+    void genericAddonProviderNormalizesStandardPatternAndRetainsItsPhysicalBinding() {
+        NetworkCraftingProviders providers = new NetworkCraftingProviders();
+        BuiltIn builtIn = builtIn();
+        ICraftingProvider generic = provider(List.of(builtIn.details()), 7);
+        providers.addProvider(node(generic));
+        LegacyPatternNormalizer normalizer = mock(LegacyPatternNormalizer.class);
+        when(normalizer.keyRegistryGeneration()).thenReturn(17L);
+        CompiledPattern compiled = compiled(builtIn.id().value(), 17L);
+        when(normalizer.normalize(eq(builtIn.details()), any(Level.class), eq(RecipeRevision.ZERO)))
+                .thenReturn(normalized(compiled));
+
+        Success success = assertInstanceOf(Success.class,
+                providers.buildNormalizedPatternSnapshot(new GraphGeneration(0L), 4L, RecipeRevision.ZERO,
+                        normalizer));
+
+        assertFalse(success.snapshot().hasLegacyFallback());
+        assertEquals(Map.of(builtIn.id(), compiled), success.snapshot().patternsById());
+        assertEquals(Map.of(builtIn.id(), 7), success.snapshot().maxProviderPriorities());
+        assertEquals(1, success.snapshot().eligiblePhysicalBindingCount());
+        assertEquals(List.of(generic), toList(providers.getMediums(builtIn.details())));
     }
 
     @Test
@@ -307,6 +331,12 @@ class NetworkCraftingProvidersNormalizedShadowTest {
 
     private static ICraftingProvider genericProvider() {
         return provider(List.of(), 0);
+    }
+
+    private static List<ICraftingProvider> toList(Iterable<ICraftingProvider> providers) {
+        List<ICraftingProvider> result = new java.util.ArrayList<>();
+        providers.forEach(result::add);
+        return result;
     }
 
     private static IPatternDetails patternWithOutput(String id) {
