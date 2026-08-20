@@ -42,6 +42,7 @@ import appeng.api.networking.IGrid;
 import appeng.api.networking.IGridNode;
 import appeng.api.networking.crafting.CraftingJobStatus;
 import appeng.api.networking.crafting.ICraftingCPU;
+import appeng.api.networking.crafting.ICraftingLink;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.networking.crafting.ICraftingRequester;
 import appeng.api.networking.crafting.ICraftingSubmitResult;
@@ -57,6 +58,7 @@ import appeng.blockentity.crafting.CraftingMonitorBlockEntity;
 import appeng.core.AELog;
 import appeng.core.sync.network.NetworkHandler;
 import appeng.core.sync.packets.CraftingJobStatusPacket;
+import appeng.crafting.CraftingLink;
 import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.execution.CraftingCpuLogic;
 import appeng.me.cluster.IAECluster;
@@ -84,6 +86,7 @@ import appeng.util.ConfigManager;
 public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
 
     private static final String LOG_MARK_AS_COMPLETE = "Completed job for %s.";
+    private static final String EXACT_REQUESTER_LINK = "ae2RebuildExactRequesterLink";
 
     private final BlockPos boundsMin;
     private final BlockPos boundsMax;
@@ -114,6 +117,8 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     private UUID exactPlayerId;
     private long exactStartedNanos;
     private boolean exactCancellationRequested;
+    @Nullable
+    private CraftingLink exactRequesterLink;
 
     public CraftingCPUCluster(BlockPos boundsMin, BlockPos boundsMax) {
         this.boundsMin = boundsMin.immutable();
@@ -231,6 +236,7 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             var after = exactSession.snapshot();
             if (after.ledger().state() == ExactCpuLedgerState.IDLE
                     && after.broker().state() == ExactTransferBrokerState.IDLE) {
+                finishExactRequester(false);
                 exactSession = null;
             }
             return;
@@ -242,6 +248,7 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
                     .orElse(false)) {
                 notifyExactJob(exactCancellationRequested ? CraftingJobStatusPacket.Status.CANCELLED
                         : CraftingJobStatusPacket.Status.FINISHED);
+                finishExactRequester(!exactCancellationRequested);
                 exactSession = null;
             }
             return;
@@ -567,6 +574,13 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
         this.craftingLogic.writeToNBT(data);
         this.configManager.writeToNBT(data);
         this.exactRecovery.writeToNbt(data);
+        if (exactRequesterLink != null) {
+            CompoundTag link = new CompoundTag();
+            exactRequesterLink.writeToNBT(link);
+            data.put(EXACT_REQUESTER_LINK, link);
+        } else {
+            data.remove(EXACT_REQUESTER_LINK);
+        }
     }
 
     void done() {
@@ -589,6 +603,46 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
         this.craftingLogic.readFromNBT(data);
         this.configManager.readFromNBT(data);
         this.exactRecovery.readFromNbt(data, this.exactKeyRegistry());
+        exactRequesterLink = data.contains(EXACT_REQUESTER_LINK, net.minecraft.nbt.Tag.TAG_COMPOUND)
+                ? new CraftingLink(data.getCompound(EXACT_REQUESTER_LINK), this)
+                : null;
+    }
+
+    /** Creates the durable requester link after exact custody has been handed to this CPU. */
+    public CraftingLink attachExactRequester(IGrid grid, ICraftingRequester requester) {
+        requireExactServerThread();
+        Objects.requireNonNull(grid, "grid");
+        Objects.requireNonNull(requester, "requester");
+        if (exactSession == null || exactSession.snapshot().workOrder().isEmpty() || exactRequesterLink != null) {
+            throw new IllegalStateException("CPU cannot attach an exact requester in its current state");
+        }
+        UUID craftId = UUID.randomUUID();
+        CraftingLink cpuLink = new CraftingLink(CraftingCpuHelper.generateLinkData(craftId, false, false), this);
+        CraftingLink requesterLink = new CraftingLink(CraftingCpuHelper.generateLinkData(craftId, false, true),
+                requester);
+        CraftingService service = (CraftingService) grid.getCraftingService();
+        service.addLink(cpuLink);
+        service.addLink(requesterLink);
+        exactRequesterLink = cpuLink;
+        markDirty();
+        return requesterLink;
+    }
+
+    public @Nullable ICraftingLink getExactRequesterLink() {
+        return exactRequesterLink;
+    }
+
+    private void finishExactRequester(boolean completed) {
+        if (exactRequesterLink == null) {
+            return;
+        }
+        if (completed) {
+            exactRequesterLink.markDone();
+        } else {
+            exactRequesterLink.cancel();
+        }
+        exactRequesterLink = null;
+        markDirty();
     }
 
     /** Publishes a validated exact checkpoint and dirties the native core only after its canonical NBT is available. */

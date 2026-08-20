@@ -340,6 +340,10 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
                 if (maybeLink != null) {
                     this.addLink((CraftingLink) maybeLink);
                 }
+                ICraftingLink exactLink = cluster.getExactRequesterLink();
+                if (exactLink != null) {
+                    this.addLink((CraftingLink) exactLink);
+                }
             }
         }
     }
@@ -554,12 +558,7 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             throw new IllegalArgumentException("Invalid Crafting Job Request");
         }
 
-        IActionSource calculationSource = simRequester.getActionSource();
-        // Automatic requesters still require a durable requester-link delivery protocol. Keep them on the native
-        // legacy calculation until that protocol is exact; never hand an exact authoritative plan to legacy execution.
-        ExactCalculationInput exact = calculationSource != null && calculationSource.player().isPresent()
-                ? captureExactCalculation(what, AEAmount.of(amount))
-                : null;
+        ExactCalculationInput exact = captureExactCalculation(what, AEAmount.of(amount));
         if (exact != null) {
             return CompletableFuture.supplyAsync(() -> calculateExact(what, amount, exact), CRAFTING_POOL);
         }
@@ -699,14 +698,13 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         }
 
         if (job instanceof ExactCraftingPlanAdapter exact) {
-            return requestingMachine == null ? submitExact(cpuCluster, exact, src)
-                    : CraftingSubmitResult.INCOMPLETE_PLAN;
+            return submitExact(cpuCluster, exact, requestingMachine, src);
         }
         return cpuCluster.submitJob(this.grid, job, src, requestingMachine);
     }
 
     private ICraftingSubmitResult submitExact(CraftingCPUCluster cpu, ExactCraftingPlanAdapter plan,
-            IActionSource source) {
+            @Nullable ICraftingRequester requester, IActionSource source) {
         try {
             var storage = storageService.getBrokerExactStorage(exactThreadGate(cpu));
             var patterns = exactPatternSource();
@@ -730,10 +728,15 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
                 }
                 return CraftingSubmitResult.CPU_BUSY;
             }
-            return CraftingSubmitResult.successful(null);
+            CraftingLink requesterLink = requester == null ? null : cpu.attachExactRequester(grid, requester);
+            return CraftingSubmitResult.successful(requesterLink);
         } catch (RuntimeException failure) {
             try {
-                cpu.discardPreparedExactPlan();
+                if (cpu.hasExactExecution()) {
+                    cpu.cancelJob();
+                } else {
+                    cpu.discardPreparedExactPlan();
+                }
             } catch (RuntimeException ignored) {
                 // A durable reservation or fail-closed recovery authority must remain attached to its CPU.
             }
