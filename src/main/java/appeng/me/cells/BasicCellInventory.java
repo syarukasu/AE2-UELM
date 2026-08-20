@@ -66,6 +66,7 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
     private static final String ITEM_COUNT_TAG = "ic";
     private static final String STACK_KEYS = "keys";
     private static final String STACK_AMOUNTS = "amts";
+    private static final int MAX_TOOLTIP_PREVIEW = 16;
 
     private final ISaveProvider container;
     private final AEKeyType keyType;
@@ -341,6 +342,36 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
         return storedItemCount;
     }
 
+    /** Exact bounded item-NBT preview used when the server-owned UUID database is unavailable on the client. */
+    public Map<AEKey, AEAmount> getExactTooltipContents() {
+        if (currentManager() != null || !hasExactCellId()) {
+            return Map.copyOf(getCellItems());
+        }
+        ListTag preview = getTag().getList(ExactCellStorageManager.CELL_PREVIEW_TAG, Tag.TAG_COMPOUND);
+        if (preview.size() > MAX_TOOLTIP_PREVIEW) {
+            return Map.of();
+        }
+        Map<AEKey, AEAmount> result = new LinkedHashMap<>();
+        try {
+            for (int index = 0; index < preview.size(); index++) {
+                CompoundTag entry = preview.getCompound(index);
+                if (entry.size() != 2 || !entry.contains("key", Tag.TAG_COMPOUND)
+                        || !entry.contains("amount", Tag.TAG_COMPOUND)) {
+                    return Map.of();
+                }
+                AEKey key = AEKey.fromTagGeneric(entry.getCompound("key"));
+                PersistenceDecodeResult<AEAmount> decoded = AEAmountNbtCodec.decode(entry.getCompound("amount"));
+                if (key == null || !(decoded instanceof PersistenceDecodeResult.Success<AEAmount> success)
+                        || success.value().equals(AEAmount.ZERO) || result.put(key, success.value()) != null) {
+                    return Map.of();
+                }
+            }
+        } catch (RuntimeException ignored) {
+            return Map.of();
+        }
+        return Map.copyOf(result);
+    }
+
     public long getStoredItemTypes() {
         getCellItems();
         return this.storedItems;
@@ -609,6 +640,19 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
         tag.put(ExactCellStorageManager.CELL_COUNT_TAG, AEAmountNbtCodec.encode(storedItemCount));
         tag.putInt(ExactCellStorageManager.CELL_TYPES_TAG, storedItems);
         tag.putLong(ITEM_COUNT_TAG, projectLong(storedItemCount));
+        ListTag preview = new ListTag();
+        getCellItems().entrySet().stream().sorted(Map.Entry.<AEKey, AEAmount>comparingByValue().reversed())
+                .limit(MAX_TOOLTIP_PREVIEW).forEach(entry -> {
+                    CompoundTag previewEntry = new CompoundTag();
+                    previewEntry.put("key", entry.getKey().toTagGeneric());
+                    previewEntry.put("amount", AEAmountNbtCodec.encode(entry.getValue()));
+                    preview.add(previewEntry);
+                });
+        if (preview.isEmpty()) {
+            tag.remove(ExactCellStorageManager.CELL_PREVIEW_TAG);
+        } else {
+            tag.put(ExactCellStorageManager.CELL_PREVIEW_TAG, preview);
+        }
         tag.remove(STACK_KEYS);
         tag.remove(STACK_AMOUNTS);
     }

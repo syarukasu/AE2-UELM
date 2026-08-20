@@ -29,13 +29,14 @@ import net.minecraft.world.inventory.tooltip.TooltipComponent;
 import net.minecraft.world.item.ItemStack;
 
 import appeng.api.config.IncludeExclude;
-import appeng.api.stacks.GenericStack;
 import appeng.api.storage.cells.ICellHandler;
 import appeng.api.storage.cells.ISaveProvider;
 import appeng.core.AEConfig;
 import appeng.core.localization.GuiText;
 import appeng.core.localization.Tooltips;
+import appeng.items.storage.ExactTooltipStack;
 import appeng.items.storage.StorageCellTooltipComponent;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * Cell handler that manages all normal storage cells (items, fluids).
@@ -91,15 +92,15 @@ public class BasicCellHandler implements ICellHandler {
 
         // Find items with the highest stored amount
         boolean hasMoreContent;
-        List<GenericStack> content;
+        List<ExactTooltipStack> content;
         if (AEConfig.instance().isTooltipShowCellContent()) {
             content = new ArrayList<>();
 
             var maxCountShown = AEConfig.instance().getTooltipMaxCellContentShown();
 
-            var availableStacks = handler.getAvailableStacks();
-            for (var entry : availableStacks) {
-                content.add(new GenericStack(entry.getKey(), entry.getLongValue()));
+            var availableStacks = handler.getExactTooltipContents();
+            for (var entry : availableStacks.entrySet()) {
+                content.add(new ExactTooltipStack(entry.getKey(), entry.getValue()));
             }
 
             // Fill up with stacks from the filter if it's not inverted
@@ -109,8 +110,8 @@ public class BasicCellHandler implements ICellHandler {
                     var what = config.getKey(i);
                     if (what != null) {
                         // Don't add it twice
-                        if (availableStacks.get(what) <= 0) {
-                            content.add(new GenericStack(what, 0));
+                        if (!availableStacks.containsKey(what)) {
+                            content.add(new ExactTooltipStack(what, AEAmount.ZERO));
                         }
                     }
                     if (content.size() > maxCountShown) {
@@ -120,7 +121,7 @@ public class BasicCellHandler implements ICellHandler {
             }
 
             // Sort by amount descending
-            content.sort(Comparator.comparingLong(GenericStack::amount).reversed());
+            content.sort(Comparator.comparing(ExactTooltipStack::amount).reversed());
 
             hasMoreContent = content.size() > maxCountShown;
             if (content.size() > maxCountShown) {

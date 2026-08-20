@@ -37,6 +37,7 @@ public final class ExactCellStorageManager extends AESavedData {
     public static final String CELL_ID_TAG = "ae2ExactCellId";
     public static final String CELL_COUNT_TAG = "ae2ExactCellCount";
     public static final String CELL_TYPES_TAG = "ae2ExactCellTypes";
+    public static final String CELL_PREVIEW_TAG = "ae2ExactCellPreview";
     public static final int MAX_CELLS = 65_536;
     public static final int MAX_KEYS_PER_CELL = 65_536;
 

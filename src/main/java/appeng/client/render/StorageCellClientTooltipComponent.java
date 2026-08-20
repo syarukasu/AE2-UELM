@@ -16,6 +16,8 @@ import appeng.api.stacks.AmountFormat;
 import appeng.client.gui.me.common.StackSizeRenderer;
 import appeng.core.localization.GuiText;
 import appeng.items.storage.StorageCellTooltipComponent;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.quantity.AEAmount;
 
 public class StorageCellClientTooltipComponent implements ClientTooltipComponent {
     private final StorageCellTooltipComponent tooltipComponent;
@@ -100,7 +102,7 @@ public class StorageCellClientTooltipComponent implements ClientTooltipComponent
             if (tooltipComponent.showAmounts()) {
                 xoff = 0;
                 for (var stack : content) {
-                    var amtText = stack.what().formatAmount(stack.amount(), AmountFormat.SLOT);
+                    var amtText = formatExactAmount(stack.what(), stack.amount());
                     StackSizeRenderer.renderSizeLabel(guiGraphics, font, x + xoff, y, amtText, false);
                     xoff += 17;
                 }
@@ -116,5 +118,14 @@ public class StorageCellClientTooltipComponent implements ClientTooltipComponent
                 xoff += 17;
             }
         }
+    }
+
+    private static String formatExactAmount(appeng.api.stacks.AEKey key, AEAmount amount) {
+        var projected = LegacyAmountProjection.project(amount);
+        if (!projected.saturated()) {
+            return key.formatAmount(projected.amount(), AmountFormat.SLOT);
+        }
+        String exact = amount.toString();
+        return exact.length() <= 8 ? exact : exact.substring(0, 4) + "e" + (exact.length() - 1);
     }
 }

@@ -44,17 +44,18 @@ import appeng.api.implementations.menuobjects.IMenuItem;
 import appeng.api.networking.GridHelper;
 import appeng.api.parts.IPartHost;
 import appeng.api.stacks.AEItemKey;
-import appeng.api.stacks.GenericStack;
 import appeng.api.util.DimensionalBlockPos;
 import appeng.api.util.INetworkToolAware;
 import appeng.hooks.AEToolItem;
 import appeng.items.AEBaseItem;
 import appeng.items.contents.NetworkToolMenuHost;
+import appeng.items.storage.ExactTooltipStack;
 import appeng.items.storage.StorageCellTooltipComponent;
 import appeng.menu.MenuOpener;
 import appeng.menu.locator.MenuLocators;
 import appeng.menu.me.networktool.NetworkStatusMenu;
 import appeng.menu.me.networktool.NetworkToolMenu;
+import appeng.rebuild.quantity.AEAmount;
 import appeng.util.Platform;
 
 public class NetworkToolItem extends AEBaseItem implements IMenuItem, AEToolItem {
@@ -166,13 +167,13 @@ public class NetworkToolItem extends AEBaseItem implements IMenuItem, AEToolItem
         for (var card : toolHost.getInventory()) {
             upgradeCards.merge(AEItemKey.of(card), card.getCount(), Integer::sum);
         }
-        var stacks = new ArrayList<GenericStack>(upgradeCards.size());
+        var stacks = new ArrayList<ExactTooltipStack>(upgradeCards.size());
         for (var entry : upgradeCards.entrySet()) {
-            stacks.add(new GenericStack(entry.getKey(), entry.getValue()));
+            stacks.add(new ExactTooltipStack(entry.getKey(), AEAmount.of(entry.getValue())));
         }
 
         // Sort ascending by amount
-        stacks.sort(Comparator.comparingLong(GenericStack::amount).reversed());
+        stacks.sort(Comparator.comparing(ExactTooltipStack::amount).reversed());
 
         return Optional.of(new StorageCellTooltipComponent(List.of(), stacks, false, true));
     }
