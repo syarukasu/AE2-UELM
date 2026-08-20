@@ -48,6 +48,7 @@ import appeng.api.storage.cells.StorageCell;
 import appeng.api.upgrades.IUpgradeInventory;
 import appeng.core.AELog;
 import appeng.core.definitions.AEItems;
+import appeng.rebuild.cell.ExactCellCapacityProvider;
 import appeng.rebuild.cell.ExactCellDescriptor;
 import appeng.rebuild.cell.ExactCellId;
 import appeng.rebuild.cell.ExactCellSnapshot;
@@ -128,9 +129,11 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
             }
             maxTypes = Math.min(maxTypes, this.maxItemTypes);
 
-            BigInteger totalStorage = BigInteger.valueOf(getTotalBytes())
-                    .subtract(BigInteger.valueOf(getBytesPerType()).multiply(BigInteger.valueOf(maxTypes)))
-                    .multiply(BigInteger.valueOf(keyType.getAmountPerByte())).max(BigInteger.ZERO);
+            BigInteger totalStorage = getExactTotalItemCapacity().toBigInteger()
+                    .subtract(BigInteger.valueOf(getBytesPerType())
+                            .multiply(BigInteger.valueOf(maxTypes))
+                            .multiply(BigInteger.valueOf(keyType.getAmountPerByte())))
+                    .max(BigInteger.ZERO);
             this.maxItemsPerType = AEAmount.of(totalStorage.add(BigInteger.valueOf(maxTypes - 1))
                     .divide(BigInteger.valueOf(maxTypes)));
         } else {
@@ -344,7 +347,15 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
     }
 
     public long getRemainingItemTypes() {
-        var basedOnStorage = this.getFreeBytes() / this.getBytesPerType();
+        long basedOnStorage;
+        if (getBytesPerType() == 0) {
+            basedOnStorage = getTotalItemTypes();
+        } else {
+            BigInteger typeCost = BigInteger.valueOf(getBytesPerType())
+                    .multiply(BigInteger.valueOf(keyType.getAmountPerByte()));
+            basedOnStorage = getExactRemainingItemCount().toBigInteger().divide(typeCost)
+                    .min(BigInteger.valueOf(Long.MAX_VALUE)).longValueExact();
+        }
         var baseOnTotal = this.getTotalItemTypes() - this.getStoredItemTypes();
         return Math.min(basedOnStorage, baseOnTotal);
     }
@@ -365,13 +376,16 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
 
     public AEAmount getExactRemainingItemCount() {
         getCellItems();
-        BigInteger totalCapacity = BigInteger.valueOf(getTotalBytes())
-                .multiply(BigInteger.valueOf(keyType.getAmountPerByte()));
+        BigInteger totalCapacity = getExactTotalItemCapacity().toBigInteger();
         BigInteger typeOverhead = BigInteger.valueOf(getStoredItemTypes())
                 .multiply(BigInteger.valueOf(getBytesPerType()))
                 .multiply(BigInteger.valueOf(keyType.getAmountPerByte()));
         BigInteger remaining = totalCapacity.subtract(typeOverhead).subtract(storedItemCount.toBigInteger());
         return AEAmount.of(remaining.max(BigInteger.ZERO));
+    }
+
+    public AEAmount getExactTotalItemCapacity() {
+        return ExactCellCapacityProvider.capacityOf(cellType, i);
     }
 
     public int getUnusedItemCount() {
@@ -633,7 +647,8 @@ public class BasicCellInventory implements StorageCell, ExactMountedStorage {
 
     private ExactCellDescriptor exactCellDescriptor() {
         return new ExactCellDescriptor(BuiltInRegistries.ITEM.getKey(i.getItem()), keyType.getId(),
-                Math.toIntExact(getTotalBytes()), getBytesPerType(), Math.toIntExact(getTotalItemTypes()));
+                Math.toIntExact(getTotalBytes()), getBytesPerType(), Math.toIntExact(getTotalItemTypes()),
+                getExactTotalItemCapacity());
     }
 
     private static long projectLong(AEAmount amount) {

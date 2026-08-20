@@ -57,6 +57,7 @@ import appeng.items.misc.PaintBallItem;
 import appeng.items.misc.WrappedGenericStack;
 import appeng.items.parts.FacadeItem;
 import appeng.items.storage.BasicStorageCell;
+import appeng.items.storage.BigIntStorageCell;
 import appeng.items.storage.CreativeCellItem;
 import appeng.items.storage.SpatialStorageCellItem;
 import appeng.items.storage.StorageTier;
@@ -253,12 +254,14 @@ public final class AEItems {
     public static final ItemDefinition<BasicStorageCell> ITEM_CELL_16K = item("16k ME Item Storage Cell", AEItemIds.ITEM_CELL_16K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_16K, ITEM_CELL_HOUSING, 1.5f, 16, 128, 63, AEKeyType.items()));
     public static final ItemDefinition<BasicStorageCell> ITEM_CELL_64K = item("64k ME Item Storage Cell", AEItemIds.ITEM_CELL_64K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_64K, ITEM_CELL_HOUSING, 2.0f, 64, 512, 63, AEKeyType.items()));
     public static final ItemDefinition<BasicStorageCell> ITEM_CELL_256K = item("256k ME Item Storage Cell", AEItemIds.ITEM_CELL_256K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_256K, ITEM_CELL_HOUSING, 2.5f, 256, 2048, 63, AEKeyType.items()));
+    public static final ItemDefinition<BigIntStorageCell> ITEM_CELL_BIGINT = item("BigInt ME Item Storage Cell", AEItemIds.ITEM_CELL_BIGINT, p -> new BigIntStorageCell(p.stacksTo(1), CELL_COMPONENT_256K, ITEM_CELL_HOUSING, 63, AEKeyType.items()));
 
     public static final ItemDefinition<BasicStorageCell> FLUID_CELL_1K = item("1k ME Fluid Storage Cell", AEItemIds.FLUID_CELL_1K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_1K, FLUID_CELL_HOUSING, 0.5f, 1, 8, 18, AEKeyType.fluids()));
     public static final ItemDefinition<BasicStorageCell> FLUID_CELL_4K = item("4k ME Fluid Storage Cell", AEItemIds.FLUID_CELL_4K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_4K, FLUID_CELL_HOUSING, 1.0f, 4, 32, 18, AEKeyType.fluids()));
     public static final ItemDefinition<BasicStorageCell> FLUID_CELL_16K = item("16k ME Fluid Storage Cell", AEItemIds.FLUID_CELL_16K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_16K, FLUID_CELL_HOUSING, 1.5f, 16, 128, 18, AEKeyType.fluids()));
     public static final ItemDefinition<BasicStorageCell> FLUID_CELL_64K = item("64k ME Fluid Storage Cell", AEItemIds.FLUID_CELL_64K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_64K, FLUID_CELL_HOUSING, 2.0f, 64, 512, 18, AEKeyType.fluids()));
     public static final ItemDefinition<BasicStorageCell> FLUID_CELL_256K = item("256k ME Fluid Storage Cell", AEItemIds.FLUID_CELL_256K, p -> new BasicStorageCell(p.stacksTo(1), CELL_COMPONENT_256K, FLUID_CELL_HOUSING, 2.5f, 256, 2048, 18, AEKeyType.fluids()));
+    public static final ItemDefinition<BigIntStorageCell> FLUID_CELL_BIGINT = item("BigInt ME Fluid Storage Cell", AEItemIds.FLUID_CELL_BIGINT, p -> new BigIntStorageCell(p.stacksTo(1), CELL_COMPONENT_256K, FLUID_CELL_HOUSING, 18, AEKeyType.fluids()));
 
     public static final ItemDefinition<SpatialStorageCellItem> SPATIAL_CELL2 = item("2³ Spatial Storage Cell", AEItemIds.SPATIAL_CELL_2, p -> new SpatialStorageCellItem(p.stacksTo(1), 2));
     public static final ItemDefinition<SpatialStorageCellItem> SPATIAL_CELL16 = item("16³ Spatial Storage Cell", AEItemIds.SPATIAL_CELL_16, p -> new SpatialStorageCellItem(p.stacksTo(1), 16));

@@ -19,6 +19,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
 
 import appeng.api.stacks.AEKey;
+import appeng.api.stacks.AEKeyTypes;
 import appeng.api.storage.cells.IBasicCellItem;
 import appeng.core.worlddata.AESavedData;
 import appeng.rebuild.persistence.AEAmountNbtCodec;
@@ -40,7 +41,8 @@ public final class ExactCellStorageManager extends AESavedData {
     public static final int MAX_KEYS_PER_CELL = 65_536;
 
     private static final String DATA_NAME = "ae2_rebuild_exact_cells";
-    private static final int FORMAT_VERSION = 2;
+    private static final int FORMAT_VERSION = 3;
+    private static final int LEGACY_FORMAT_VERSION = 2;
     private static final int MAX_UUID_ATTEMPTS = 16;
     private static final String VERSION = "version";
     private static final String CELLS = "cells";
@@ -55,6 +57,7 @@ public final class ExactCellStorageManager extends AESavedData {
     private static final String BYTES = "bytes";
     private static final String BYTES_PER_TYPE = "bytesPerType";
     private static final String TYPES = "types";
+    private static final String EXACT_CAPACITY = "exactCapacity";
 
     private final MinecraftServer server;
     private final Map<ExactCellId, CellRecord> cells;
@@ -158,7 +161,8 @@ public final class ExactCellStorageManager extends AESavedData {
         }
         ItemStack stack = new ItemStack(item);
         ExactCellDescriptor current = new ExactCellDescriptor(record.descriptor.itemId(), cellItem.getKeyType().getId(),
-                cellItem.getBytes(stack), cellItem.getBytesPerType(stack), cellItem.getTotalTypes(stack));
+                cellItem.getBytes(stack), cellItem.getBytesPerType(stack), cellItem.getTotalTypes(stack),
+                ExactCellCapacityProvider.capacityOf(cellItem, stack));
         if (!current.equals(record.descriptor)) {
             throw new IllegalStateException("recovered cell type no longer matches its persisted capacity");
         }
@@ -234,8 +238,11 @@ public final class ExactCellStorageManager extends AESavedData {
     }
 
     private static ExactCellStorageManager load(MinecraftServer server, CompoundTag tag) {
-        if (tag.size() != 2 || !tag.contains(VERSION, Tag.TAG_INT) || !tag.contains(CELLS, Tag.TAG_LIST)
-                || tag.getInt(VERSION) != FORMAT_VERSION) {
+        if (tag.size() != 2 || !tag.contains(VERSION, Tag.TAG_INT) || !tag.contains(CELLS, Tag.TAG_LIST)) {
+            throw new IllegalStateException("malformed or unsupported exact cell database");
+        }
+        int formatVersion = tag.getInt(VERSION);
+        if (formatVersion != LEGACY_FORMAT_VERSION && formatVersion != FORMAT_VERSION) {
             throw new IllegalStateException("malformed or unsupported exact cell database");
         }
         ListTag cellList = tag.getList(CELLS, Tag.TAG_COMPOUND);
@@ -270,7 +277,7 @@ public final class ExactCellStorageManager extends AESavedData {
                 }
             }
             ExactCellId id = new ExactCellId(cellTag.getUUID(ID));
-            ExactCellDescriptor descriptor = decodeDescriptor(cellTag.getCompound(DESCRIPTOR));
+            ExactCellDescriptor descriptor = decodeDescriptor(cellTag.getCompound(DESCRIPTOR), formatVersion);
             if (cells.put(id, new CellRecord(descriptor, revision, ExactCellSnapshot.copyAmounts(amounts))) != null) {
                 throw new IllegalStateException("duplicate exact cell identity");
             }
@@ -291,19 +298,33 @@ public final class ExactCellStorageManager extends AESavedData {
         tag.putInt(BYTES, descriptor.totalBytes());
         tag.putInt(BYTES_PER_TYPE, descriptor.bytesPerType());
         tag.putInt(TYPES, descriptor.totalTypes());
+        tag.put(EXACT_CAPACITY, AEAmountNbtCodec.encode(descriptor.exactTotalCapacity()));
         return tag;
     }
 
-    private static ExactCellDescriptor decodeDescriptor(CompoundTag tag) {
-        if (tag.size() != 5 || !tag.contains(ITEM, Tag.TAG_STRING) || !tag.contains(KEY_TYPE, Tag.TAG_STRING)
+    private static ExactCellDescriptor decodeDescriptor(CompoundTag tag, int formatVersion) {
+        int expectedSize = formatVersion == LEGACY_FORMAT_VERSION ? 5 : 6;
+        if (tag.size() != expectedSize || !tag.contains(ITEM, Tag.TAG_STRING)
+                || !tag.contains(KEY_TYPE, Tag.TAG_STRING)
                 || !tag.contains(BYTES, Tag.TAG_INT) || !tag.contains(BYTES_PER_TYPE, Tag.TAG_INT)
-                || !tag.contains(TYPES, Tag.TAG_INT)) {
+                || !tag.contains(TYPES, Tag.TAG_INT)
+                || (formatVersion == FORMAT_VERSION && !tag.contains(EXACT_CAPACITY, Tag.TAG_COMPOUND))) {
             throw new IllegalStateException("malformed exact cell descriptor");
         }
         try {
-            return new ExactCellDescriptor(new ResourceLocation(tag.getString(ITEM)),
-                    new ResourceLocation(tag.getString(KEY_TYPE)), tag.getInt(BYTES), tag.getInt(BYTES_PER_TYPE),
-                    tag.getInt(TYPES));
+            ResourceLocation keyTypeId = new ResourceLocation(tag.getString(KEY_TYPE));
+            AEAmount capacity;
+            if (formatVersion == LEGACY_FORMAT_VERSION) {
+                capacity = AEAmount.of((long) tag.getInt(BYTES) * AEKeyTypes.get(keyTypeId).getAmountPerByte());
+            } else {
+                PersistenceDecodeResult<AEAmount> decoded = AEAmountNbtCodec.decode(tag.getCompound(EXACT_CAPACITY));
+                if (!(decoded instanceof PersistenceDecodeResult.Success<AEAmount> success)) {
+                    throw new IllegalStateException("malformed exact cell capacity");
+                }
+                capacity = success.value();
+            }
+            return new ExactCellDescriptor(new ResourceLocation(tag.getString(ITEM)), keyTypeId, tag.getInt(BYTES),
+                    tag.getInt(BYTES_PER_TYPE), tag.getInt(TYPES), capacity);
         } catch (RuntimeException failure) {
             throw new IllegalStateException("invalid exact cell descriptor", failure);
         }

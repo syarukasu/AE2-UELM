@@ -67,11 +67,13 @@ public final class AEItemIds {
     public static final ResourceLocation ITEM_CELL_16K = id("item_storage_cell_16k");
     public static final ResourceLocation ITEM_CELL_64K = id("item_storage_cell_64k");
     public static final ResourceLocation ITEM_CELL_256K = id("item_storage_cell_256k");
+    public static final ResourceLocation ITEM_CELL_BIGINT = id("bigint_item_storage_cell");
     public static final ResourceLocation FLUID_CELL_1K = id("fluid_storage_cell_1k");
     public static final ResourceLocation FLUID_CELL_4K = id("fluid_storage_cell_4k");
     public static final ResourceLocation FLUID_CELL_16K = id("fluid_storage_cell_16k");
     public static final ResourceLocation FLUID_CELL_64K = id("fluid_storage_cell_64k");
     public static final ResourceLocation FLUID_CELL_256K = id("fluid_storage_cell_256k");
+    public static final ResourceLocation FLUID_CELL_BIGINT = id("bigint_fluid_storage_cell");
     public static final ResourceLocation SPATIAL_CELL_2 = id("spatial_storage_cell_2");
     public static final ResourceLocation SPATIAL_CELL_16 = id("spatial_storage_cell_16");
     public static final ResourceLocation SPATIAL_CELL_128 = id("spatial_storage_cell_128");
