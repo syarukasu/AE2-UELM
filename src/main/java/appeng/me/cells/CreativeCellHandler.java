@@ -26,14 +26,15 @@ import java.util.Optional;
 import net.minecraft.world.inventory.tooltip.TooltipComponent;
 import net.minecraft.world.item.ItemStack;
 
-import appeng.api.stacks.GenericStack;
 import appeng.api.storage.cells.ICellHandler;
 import appeng.api.storage.cells.ISaveProvider;
 import appeng.api.storage.cells.StorageCell;
 import appeng.core.AEConfig;
 import appeng.items.contents.CellConfig;
 import appeng.items.storage.CreativeCellItem;
+import appeng.items.storage.ExactTooltipStack;
 import appeng.items.storage.StorageCellTooltipComponent;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * Cell handler for creative storage cells (both fluid and item), which do not allow item insertion.
@@ -63,14 +64,14 @@ public class CreativeCellHandler implements ICellHandler {
         var cc = CellConfig.create(is);
 
         boolean hasMoreContent;
-        List<GenericStack> content;
+        List<ExactTooltipStack> content;
         if (AEConfig.instance().isTooltipShowCellContent()) {
             content = new ArrayList<>();
 
             var maxCountShown = AEConfig.instance().getTooltipMaxCellContentShown();
 
             for (var key : cc.keySet()) {
-                content.add(new GenericStack(key, 1));
+                content.add(new ExactTooltipStack(key, AEAmount.ONE));
             }
 
             hasMoreContent = content.size() > maxCountShown;

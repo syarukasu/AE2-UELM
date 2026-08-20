@@ -20,7 +20,11 @@ package appeng.menu.me.common;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -76,6 +80,7 @@ import appeng.core.sync.packets.MEInteractionPacket;
 import appeng.core.sync.packets.MEInventoryUpdatePacket;
 import appeng.helpers.InventoryAction;
 import appeng.me.helpers.ChannelPowerSrc;
+import appeng.me.service.StorageService;
 import appeng.menu.AEBaseMenu;
 import appeng.menu.SlotSemantics;
 import appeng.menu.ToolboxMenu;
@@ -84,6 +89,8 @@ import appeng.menu.implementations.MenuTypeBuilder;
 import appeng.menu.me.crafting.CraftAmountMenu;
 import appeng.menu.slot.AppEngSlot;
 import appeng.menu.slot.RestrictedInputSlot;
+import appeng.rebuild.quantity.AEAmount;
+import appeng.rebuild.storage.StorageSnapshotCaptureResult;
 import appeng.util.ConfigManager;
 import appeng.util.IConfigManagerListener;
 import appeng.util.Platform;
@@ -152,6 +159,7 @@ public class MEStorageMenu extends AEBaseMenu
      */
     private Set<AEKey> previousCraftables = Collections.emptySet();
     private KeyCounter previousAvailableStacks = new KeyCounter();
+    private Map<AEKey, AEAmount> previousExactAvailableStacks = Map.of();
 
     public MEStorageMenu(MenuType<?> menuType, int id, Inventory ip, ITerminalHost host) {
         this(menuType, id, ip, host, true);
@@ -265,6 +273,7 @@ public class MEStorageMenu extends AEBaseMenu
 
             var craftables = getCraftablesFromGrid();
             var availableStacks = storage == null ? new KeyCounter() : storage.getAvailableStacks();
+            var exactAvailableStacks = getExactAvailableStacks(availableStacks);
 
             // This is currently not supported/backed by any network service
             var requestables = new KeyCounter();
@@ -277,15 +286,17 @@ public class MEStorageMenu extends AEBaseMenu
                 Sets.difference(craftables, previousCraftables).forEach(updateHelper::addChange);
 
                 // Available changes
-                previousAvailableStacks.removeAll(availableStacks);
-                previousAvailableStacks.removeZeros();
-                previousAvailableStacks.keySet().forEach(updateHelper::addChange);
+                var changedExactKeys = new HashSet<AEKey>(previousExactAvailableStacks.keySet());
+                changedExactKeys.addAll(exactAvailableStacks.keySet());
+                changedExactKeys.removeIf(key -> Objects.equals(previousExactAvailableStacks.get(key),
+                        exactAvailableStacks.get(key)));
+                changedExactKeys.forEach(updateHelper::addChange);
 
                 if (updateHelper.hasChanges()) {
                     var builder = MEInventoryUpdatePacket
                             .builder(containerId, updateHelper.isFullUpdate());
                     builder.setFilter(this::isKeyVisible);
-                    builder.addChanges(updateHelper, availableStacks, craftables, requestables);
+                    builder.addChanges(updateHelper, exactAvailableStacks, craftables, requestables);
                     builder.buildAndSend(this::sendPacketToClient);
                     updateHelper.commitChanges();
                 }
@@ -296,12 +307,38 @@ public class MEStorageMenu extends AEBaseMenu
 
             previousCraftables = ImmutableSet.copyOf(craftables);
             previousAvailableStacks = availableStacks;
+            previousExactAvailableStacks = exactAvailableStacks;
 
             this.updatePowerStatus();
 
             super.broadcastChanges();
         }
 
+    }
+
+    private Map<AEKey, AEAmount> getExactAvailableStacks(KeyCounter fallback) {
+        Map<AEKey, AEAmount> result = new HashMap<>();
+        for (var entry : fallback) {
+            result.put(entry.getKey(), AEAmount.of(entry.getLongValue()));
+        }
+        IGridNode node = networkNode;
+        if (node == null && host instanceof IActionHost actionHost) {
+            node = actionHost.getActionableNode();
+        }
+        if (node == null || !node.isActive() || !(node.getGrid().getStorageService() instanceof StorageService exact)
+                || storage != node.getGrid().getStorageService().getInventory()) {
+            return Map.copyOf(result);
+        }
+        var captured = exact.getExactStorage().captureSnapshot();
+        if (!(captured instanceof StorageSnapshotCaptureResult.Success success)) {
+            return Map.copyOf(result);
+        }
+        result.clear();
+        var registry = exact.getExactStorage().keyRegistry();
+        for (var key : success.snapshot().nonZeroKeys()) {
+            result.put(registry.resolve(key), success.snapshot().amount(key));
+        }
+        return Map.copyOf(result);
     }
 
     protected boolean showsCraftables() {

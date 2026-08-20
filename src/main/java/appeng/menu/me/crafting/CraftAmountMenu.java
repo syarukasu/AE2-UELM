@@ -33,6 +33,7 @@ import appeng.api.stacks.GenericStack;
 import appeng.api.storage.ISubMenuHost;
 import appeng.core.sync.network.NetworkHandler;
 import appeng.core.sync.packets.ConfirmAutoCraftPacket;
+import appeng.me.service.StorageService;
 import appeng.menu.AEBaseMenu;
 import appeng.menu.ISubMenu;
 import appeng.menu.MenuOpener;
@@ -41,6 +42,9 @@ import appeng.menu.implementations.MenuTypeBuilder;
 import appeng.menu.locator.MenuLocator;
 import appeng.menu.slot.AppEngSlot;
 import appeng.menu.slot.InaccessibleSlot;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.quantity.AEAmount;
+import appeng.rebuild.storage.StorageSnapshotCaptureResult;
 import appeng.util.inv.AppEngInternalInventory;
 
 /**
@@ -81,6 +85,10 @@ public class CraftAmountMenu extends AEBaseMenu implements ISubMenu {
      * Opens the craft amount screen for the given player.
      */
     public static void open(ServerPlayer player, MenuLocator locator, AEKey whatToCraft, long initialAmount) {
+        open(player, locator, whatToCraft, AEAmount.of(initialAmount));
+    }
+
+    public static void open(ServerPlayer player, MenuLocator locator, AEKey whatToCraft, AEAmount initialAmount) {
         MenuOpener.open(CraftAmountMenu.TYPE, player, locator);
 
         if (player.containerMenu instanceof CraftAmountMenu cca) {
@@ -93,9 +101,10 @@ public class CraftAmountMenu extends AEBaseMenu implements ISubMenu {
         return this.getPlayerInventory().player.level();
     }
 
-    private void setWhatToCraft(AEKey whatToCraft, long initialAmount) {
+    private void setWhatToCraft(AEKey whatToCraft, AEAmount initialAmount) {
         this.whatToCraft = Objects.requireNonNull(whatToCraft, "whatToCraft");
-        this.craftingItem.set(GenericStack.wrapInItemStack(whatToCraft, initialAmount));
+        this.craftingItem.set(GenericStack.wrapInItemStack(whatToCraft,
+                LegacyAmountProjection.saturatingLong(initialAmount)));
     }
 
     /**
@@ -107,6 +116,10 @@ public class CraftAmountMenu extends AEBaseMenu implements ISubMenu {
      * @param autoStart          Start crafting immediately when the planning is done.
      */
     public void confirm(long amount, boolean craftMissingAmount, boolean autoStart) {
+        confirm(AEAmount.of(amount), craftMissingAmount, autoStart);
+    }
+
+    public void confirm(AEAmount amount, boolean craftMissingAmount, boolean autoStart) {
         if (!isServerSide()) {
             NetworkHandler.instance().sendToServer(new ConfirmAutoCraftPacket(amount, craftMissingAmount, autoStart));
             return;
@@ -122,13 +135,17 @@ public class CraftAmountMenu extends AEBaseMenu implements ISubMenu {
                 var node = host.getActionableNode();
                 if (node != null) {
                     var storage = node.getGrid().getStorageService();
-                    var existingAmount = Math.min(storage.getCachedInventory().get(whatToCraft),
-                            Long.MAX_VALUE);
-                    if (existingAmount > amount) {
-                        amount = 0;
-                    } else {
-                        amount -= existingAmount;
+                    if (!(storage instanceof StorageService exactStorage)) {
+                        return;
                     }
+                    var key = exactStorage.getExactStorage().keyRegistry().lookup(whatToCraft);
+                    var captured = exactStorage.getExactStorage().captureSnapshot();
+                    if (!(captured instanceof StorageSnapshotCaptureResult.Success success)) {
+                        return;
+                    }
+                    var existingAmount = key == null ? AEAmount.ZERO : success.snapshot().amount(key);
+                    amount = existingAmount.compareTo(amount) >= 0 ? AEAmount.ZERO
+                            : amount.subtractExact(existingAmount);
                 }
             }
         }
@@ -136,12 +153,12 @@ public class CraftAmountMenu extends AEBaseMenu implements ISubMenu {
         var locator = getLocator();
         if (locator != null) {
             var player = getPlayer();
-            if (amount > 0) {
+            if (!amount.equals(AEAmount.ZERO)) {
                 MenuOpener.open(CraftConfirmMenu.TYPE, player, locator);
 
                 if (player.containerMenu instanceof CraftConfirmMenu ccc) {
                     ccc.setAutoStart(autoStart);
-                    ccc.planJob(
+                    ccc.planExactJob(
                             whatToCraft,
                             amount,
                             CalculationStrategy.REPORT_MISSING_ITEMS);

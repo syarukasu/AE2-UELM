@@ -23,6 +23,8 @@ import java.util.Comparator;
 import net.minecraft.network.FriendlyByteBuf;
 
 import appeng.api.stacks.AEKey;
+import appeng.rebuild.api.exact.ExactAmountCodec;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * Describes an entry in the crafting plan which describes how many items of one type are missing, already stored in the
@@ -37,13 +39,13 @@ public class CraftingPlanSummaryEntry implements Comparable<CraftingPlanSummaryE
             .reversed();
 
     private final AEKey what;
-    private final long missingAmount;
-    private final long storedAmount;
-    private final long craftAmount;
-    private final long availableAmount;
+    private final AEAmount missingAmount;
+    private final AEAmount storedAmount;
+    private final AEAmount craftAmount;
+    private final AEAmount availableAmount;
 
-    public CraftingPlanSummaryEntry(AEKey what, long missingAmount, long storedAmount, long craftAmount,
-            long availableAmount) {
+    public CraftingPlanSummaryEntry(AEKey what, AEAmount missingAmount, AEAmount storedAmount, AEAmount craftAmount,
+            AEAmount availableAmount) {
         this.what = what;
         this.missingAmount = missingAmount;
         this.storedAmount = storedAmount;
@@ -53,26 +55,27 @@ public class CraftingPlanSummaryEntry implements Comparable<CraftingPlanSummaryE
 
     @Deprecated
     public CraftingPlanSummaryEntry(AEKey what, long missingAmount, long storedAmount, long craftAmount) {
-        this(what, missingAmount, storedAmount, craftAmount, storedAmount);
+        this(what, AEAmount.of(missingAmount), AEAmount.of(storedAmount), AEAmount.of(craftAmount),
+                AEAmount.of(storedAmount));
     }
 
     public AEKey getWhat() {
         return what;
     }
 
-    public long getMissingAmount() {
+    public AEAmount getMissingAmount() {
         return missingAmount;
     }
 
-    public long getStoredAmount() {
+    public AEAmount getStoredAmount() {
         return storedAmount;
     }
 
-    public long getCraftAmount() {
+    public AEAmount getCraftAmount() {
         return craftAmount;
     }
 
-    public long getAvailableAmount() {
+    public AEAmount getAvailableAmount() {
         return availableAmount;
     }
 
@@ -83,18 +86,26 @@ public class CraftingPlanSummaryEntry implements Comparable<CraftingPlanSummaryE
 
     public void write(FriendlyByteBuf buffer) {
         AEKey.writeKey(buffer, what);
-        buffer.writeVarLong(missingAmount);
-        buffer.writeVarLong(storedAmount);
-        buffer.writeVarLong(craftAmount);
-        buffer.writeVarLong(availableAmount);
+        ExactAmountCodec.write(buffer, missingAmount);
+        ExactAmountCodec.write(buffer, storedAmount);
+        ExactAmountCodec.write(buffer, craftAmount);
+        ExactAmountCodec.write(buffer, availableAmount);
     }
 
     public static CraftingPlanSummaryEntry read(FriendlyByteBuf buffer) {
         var what = AEKey.readKey(buffer);
-        long missingAmount = buffer.readVarLong();
-        long storedAmount = buffer.readVarLong();
-        long craftAmount = buffer.readVarLong();
-        long availableAmount = buffer.readVarLong();
+        AEAmount missingAmount = readAmount(buffer);
+        AEAmount storedAmount = readAmount(buffer);
+        AEAmount craftAmount = readAmount(buffer);
+        AEAmount availableAmount = readAmount(buffer);
         return new CraftingPlanSummaryEntry(what, missingAmount, storedAmount, craftAmount, availableAmount);
+    }
+
+    private static AEAmount readAmount(FriendlyByteBuf buffer) {
+        var decoded = ExactAmountCodec.read(buffer);
+        if (decoded instanceof ExactAmountCodec.Success success) {
+            return success.amount();
+        }
+        throw new IllegalArgumentException("Malformed exact crafting plan amount");
     }
 }

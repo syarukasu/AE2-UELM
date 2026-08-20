@@ -48,6 +48,7 @@ public class ItemModelProvider extends net.minecraftforge.client.model.generator
         storageCell(AEItems.ITEM_CELL_16K, "item/item_storage_cell_16k");
         storageCell(AEItems.ITEM_CELL_64K, "item/item_storage_cell_64k");
         storageCell(AEItems.ITEM_CELL_256K, "item/item_storage_cell_256k");
+        storageCell(AEItems.ITEM_CELL_BIGINT, "item/item_storage_cell_256k");
         flatSingleLayer(AEItems.CERTUS_QUARTZ_CRYSTAL, "item/certus_quartz_crystal");
         flatSingleLayer(AEItems.CERTUS_QUARTZ_CRYSTAL_CHARGED, "item/certus_quartz_crystal_charged");
         flatSingleLayer(AEItems.CERTUS_QUARTZ_DUST, "item/certus_quartz_dust");
@@ -70,6 +71,7 @@ public class ItemModelProvider extends net.minecraftforge.client.model.generator
         storageCell(AEItems.FLUID_CELL_16K, "item/fluid_storage_cell_16k");
         storageCell(AEItems.FLUID_CELL_64K, "item/fluid_storage_cell_64k");
         storageCell(AEItems.FLUID_CELL_256K, "item/fluid_storage_cell_256k");
+        storageCell(AEItems.FLUID_CELL_BIGINT, "item/fluid_storage_cell_256k");
         flatSingleLayer(AEItems.FLUID_CELL_CREATIVE, "item/creative_fluid_cell");
         flatSingleLayer(AEItems.FLUID_CELL_HOUSING, "item/fluid_cell_housing");
         flatSingleLayer(AEItems.FLUIX_CRYSTAL, "item/fluix_crystal");

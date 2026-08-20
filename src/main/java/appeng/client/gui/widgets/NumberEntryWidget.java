@@ -18,12 +18,14 @@
 
 package appeng.client.gui.widgets;
 
+import java.math.BigInteger;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.text.ParsePosition;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.function.Consumer;
@@ -79,6 +81,7 @@ public class NumberEntryWidget implements ICompositeWidget {
     private Runnable onConfirm;
 
     private boolean hideValidationIcon;
+    private int exactUnsignedBits;
 
     private Rect2i bounds = new Rect2i(0, 0, 0, 0);
 
@@ -109,7 +112,9 @@ public class NumberEntryWidget implements ICompositeWidget {
         });
         this.textField.setOnConfirm(() -> {
             // Only confirm if it's actually valid
-            if (this.onConfirm != null && getLongValue().isPresent()) {
+            if (this.onConfirm != null && (exactUnsignedBits > 0
+                    ? getUnsignedBigIntegerValue().isPresent()
+                    : getLongValue().isPresent())) {
                 this.onConfirm.run();
             }
         });
@@ -166,6 +171,17 @@ public class NumberEntryWidget implements ICompositeWidget {
 
     public void setMaxValue(long maxValue) {
         this.maxValue = maxValue;
+        validate();
+    }
+
+    /** Enables a positive, bounded integer mode that does not narrow input through double or long. */
+    public void setExactUnsignedIntegerMode(int maxBits) {
+        if (maxBits <= 0) {
+            throw new IllegalArgumentException("Exact integer bit bound must be positive");
+        }
+        this.exactUnsignedBits = maxBits;
+        int maxDecimalDigits = (int) Math.ceil(maxBits * Math.log10(2.0));
+        this.textField.setMaxLength(maxDecimalDigits + 1);
         validate();
     }
 
@@ -266,6 +282,13 @@ public class NumberEntryWidget implements ICompositeWidget {
      * value.
      */
     public OptionalLong getLongValue() {
+        if (exactUnsignedBits > 0) {
+            var exact = getUnsignedBigIntegerValue();
+            if (exact.isEmpty() || exact.get().bitLength() > 63) {
+                return OptionalLong.empty();
+            }
+            return OptionalLong.of(exact.get().longValueExact());
+        }
         double internalValue = getValueInternal();
         if (Double.isNaN(internalValue)) {
             return OptionalLong.empty();
@@ -290,6 +313,10 @@ public class NumberEntryWidget implements ICompositeWidget {
     }
 
     public void setLongValue(long value) {
+        if (exactUnsignedBits > 0) {
+            setUnsignedBigIntegerValue(BigInteger.valueOf(value));
+            return;
+        }
         var internalValue = convertToInternalValue(Longs.constrainToRange(value, minValue, maxValue));
         this.textField.setValue(decimalFormat.format(internalValue));
         this.textField.moveCursorToEnd();
@@ -297,7 +324,59 @@ public class NumberEntryWidget implements ICompositeWidget {
         validate();
     }
 
+    /** Returns the exact positive integer in exact mode. Expressions and decimal notation are rejected. */
+    public Optional<BigInteger> getUnsignedBigIntegerValue() {
+        if (exactUnsignedBits <= 0) {
+            var value = getLongValue();
+            return value.isPresent() ? Optional.of(BigInteger.valueOf(value.getAsLong())) : Optional.empty();
+        }
+        String value = textField.getValue().trim();
+        if (value.startsWith("=")) {
+            value = value.substring(1);
+        }
+        if (value.isEmpty()) {
+            return Optional.empty();
+        }
+        for (int index = 0; index < value.length(); index++) {
+            if (!Character.isDigit(value.charAt(index))) {
+                return Optional.empty();
+            }
+        }
+        try {
+            BigInteger parsed = new BigInteger(value);
+            if (parsed.compareTo(BigInteger.valueOf(minValue)) < 0 || parsed.bitLength() > exactUnsignedBits) {
+                return Optional.empty();
+            }
+            return Optional.of(parsed);
+        } catch (NumberFormatException malformed) {
+            return Optional.empty();
+        }
+    }
+
+    public void setUnsignedBigIntegerValue(BigInteger value) {
+        Objects.requireNonNull(value, "value");
+        if (value.signum() < 0 || (exactUnsignedBits > 0 && value.bitLength() > exactUnsignedBits)) {
+            throw new IllegalArgumentException("Exact integer is outside the configured bounds");
+        }
+        this.textField.setValue(value.toString());
+        this.textField.moveCursorToEnd();
+        this.textField.setHighlightPos(0);
+        validate();
+    }
+
     private void addQty(long delta) {
+        if (exactUnsignedBits > 0) {
+            BigInteger current = getUnsignedBigIntegerValue().orElse(BigInteger.ZERO);
+            BigInteger updated = current.add(BigInteger.valueOf(delta));
+            BigInteger minimum = BigInteger.valueOf(minValue);
+            if (updated.compareTo(minimum) < 0) {
+                updated = minimum;
+            }
+            if (updated.bitLength() <= exactUnsignedBits) {
+                setUnsignedBigIntegerValue(updated);
+            }
+            return;
+        }
         double currentValue = getValueInternal();
         if (Double.isNaN(currentValue)) {
             currentValue = 0;
@@ -348,6 +427,18 @@ public class NumberEntryWidget implements ICompositeWidget {
     private void validate() {
         List<Component> validationErrors = new ArrayList<>();
         List<Component> infoMessages = new ArrayList<>();
+
+        if (exactUnsignedBits > 0) {
+            boolean valid = getUnsignedBigIntegerValue().isPresent();
+            List<Component> tooltip = valid ? List.of() : List.of(GuiText.InvalidNumber.text());
+            this.textField.setTextColor(valid ? normalTextColor : errorTextColor);
+            this.textField.setTooltipMessage(tooltip);
+            if (this.validationIcon != null) {
+                this.validationIcon.setValid(valid);
+                this.validationIcon.setTooltip(tooltip);
+            }
+            return;
+        }
 
         double value = getValueInternal();
         if (!Double.isNaN(value)) {

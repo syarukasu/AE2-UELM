@@ -21,6 +21,7 @@ package appeng.client.gui.me.common;
 import net.minecraft.world.item.ItemStack;
 
 import appeng.menu.me.common.GridInventoryEntry;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * This is a virtual slot that has no corresponding slot on the server-side. It displays an item stack from the
@@ -51,6 +52,11 @@ public class RepoSlot extends ClientReadOnlySlot {
     public long getStoredAmount() {
         GridInventoryEntry entry = getEntry();
         return entry != null ? entry.getStoredAmount() : 0;
+    }
+
+    public AEAmount getExactStoredAmount() {
+        GridInventoryEntry entry = getEntry();
+        return entry != null ? entry.getExactStoredAmount() : AEAmount.ZERO;
     }
 
     public long getRequestableAmount() {

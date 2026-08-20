@@ -1127,6 +1127,16 @@ public class CraftingRecipes extends AE2RecipeProvider {
                 .requires(AEItems.CELL_COMPONENT_256K)
                 .unlockedBy("has_cell_component_256k", has(AEItems.CELL_COMPONENT_256K))
                 .save(consumer, AppEng.makeId("network/cells/item_storage_cell_256k_storage"));
+
+        ShapedRecipeBuilder.shaped(RecipeCategory.MISC, AEItems.ITEM_CELL_BIGINT)
+                .pattern("aba")
+                .pattern("bcb")
+                .pattern("aba")
+                .define('a', AEBlocks.QUARTZ_GLASS)
+                .define('b', AEItems.SINGULARITY)
+                .define('c', AEItems.CELL_COMPONENT_256K)
+                .unlockedBy("has_singularity", has(AEItems.SINGULARITY))
+                .save(consumer, AppEng.makeId("network/cells/bigint_item_storage_cell"));
     }
 
     private void addFluidCells(Consumer<FinishedRecipe> consumer) {
@@ -1210,6 +1220,16 @@ public class CraftingRecipes extends AE2RecipeProvider {
                 .requires(AEItems.CELL_COMPONENT_256K)
                 .unlockedBy("has_cell_component_256k", has(AEItems.CELL_COMPONENT_256K))
                 .save(consumer, AppEng.makeId("network/cells/fluid_storage_cell_256k_storage"));
+
+        ShapedRecipeBuilder.shaped(RecipeCategory.MISC, AEItems.FLUID_CELL_BIGINT)
+                .pattern("aba")
+                .pattern("bcb")
+                .pattern("aba")
+                .define('a', AEBlocks.QUARTZ_GLASS)
+                .define('b', AEItems.SINGULARITY)
+                .define('c', AEItems.CELL_COMPONENT_256K)
+                .unlockedBy("has_singularity", has(AEItems.SINGULARITY))
+                .save(consumer, AppEng.makeId("network/cells/bigint_fluid_storage_cell"));
     }
 
     private void addQuartzTools(Consumer<FinishedRecipe> consumer) {

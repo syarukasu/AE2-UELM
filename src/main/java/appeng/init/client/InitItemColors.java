@@ -57,7 +57,8 @@ public final class InitItemColors {
                 AEItems.ITEM_CELL_4K, AEItems.FLUID_CELL_4K,
                 AEItems.ITEM_CELL_16K, AEItems.FLUID_CELL_16K,
                 AEItems.ITEM_CELL_64K, AEItems.FLUID_CELL_64K,
-                AEItems.ITEM_CELL_256K, AEItems.FLUID_CELL_256K);
+                AEItems.ITEM_CELL_256K, AEItems.FLUID_CELL_256K,
+                AEItems.ITEM_CELL_BIGINT, AEItems.FLUID_CELL_BIGINT);
 
         // Automatically register colors for certain items we register
         for (ItemDefinition<?> definition : AEItems.getItems()) {

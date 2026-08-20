@@ -12,6 +12,8 @@ import appeng.client.gui.me.common.PendingCraftingJobs;
 import appeng.client.gui.me.common.PinnedKeys;
 import appeng.core.AEConfig;
 import appeng.core.sync.BasePacket;
+import appeng.rebuild.api.exact.ExactAmountCodec;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * Confirms to the player that a crafting job has started.
@@ -22,8 +24,8 @@ public class CraftingJobStatusPacket extends BasePacket {
      */
     private UUID jobId;
     private AEKey what;
-    private long requestedAmount;
-    private long remainingAmount;
+    private AEAmount requestedAmount;
+    private AEAmount remainingAmount;
     private long elapsedTime;
     private Status status;
 
@@ -31,8 +33,8 @@ public class CraftingJobStatusPacket extends BasePacket {
         this.jobId = stream.readUUID();
         this.status = stream.readEnum(Status.class);
         this.what = AEKey.readKey(stream);
-        this.requestedAmount = stream.readLong();
-        this.remainingAmount = stream.readLong();
+        this.requestedAmount = readAmount(stream);
+        this.remainingAmount = readAmount(stream);
         this.elapsedTime = stream.readLong();
     }
 
@@ -44,15 +46,28 @@ public class CraftingJobStatusPacket extends BasePacket {
 
     public CraftingJobStatusPacket(UUID jobId, AEKey what, long requestedAmount, long remainingAmount,
             long elapsedTime, Status status) {
+        this(jobId, what, AEAmount.of(requestedAmount), AEAmount.of(remainingAmount), elapsedTime, status);
+    }
+
+    public CraftingJobStatusPacket(UUID jobId, AEKey what, AEAmount requestedAmount, AEAmount remainingAmount,
+            long elapsedTime, Status status) {
         var data = new FriendlyByteBuf(Unpooled.buffer());
         data.writeInt(getPacketID());
         data.writeUUID(jobId);
         data.writeEnum(status);
         AEKey.writeKey(data, what);
-        data.writeLong(requestedAmount);
-        data.writeLong(remainingAmount);
+        ExactAmountCodec.write(data, requestedAmount);
+        ExactAmountCodec.write(data, remainingAmount);
         data.writeLong(elapsedTime);
         this.configureWrite(data);
+    }
+
+    private static AEAmount readAmount(FriendlyByteBuf data) {
+        var decoded = ExactAmountCodec.read(data);
+        if (decoded instanceof ExactAmountCodec.Success success) {
+            return success.amount();
+        }
+        throw new IllegalArgumentException("Malformed exact crafting status amount");
     }
 
     @Override

@@ -33,6 +33,10 @@ import appeng.api.networking.IGrid;
 import appeng.api.networking.crafting.ICraftingPlan;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEKey;
+import appeng.crafting.ExactCraftingPlanAdapter;
+import appeng.me.service.StorageService;
+import appeng.rebuild.quantity.AEAmount;
+import appeng.rebuild.storage.StorageSnapshotCaptureResult;
 
 /**
  * A crafting plan intended to be sent to the client.
@@ -92,8 +96,8 @@ public class CraftingPlanSummary {
     }
 
     private static class KeyStats {
-        public long stored;
-        public long crafting;
+        public AEAmount stored = AEAmount.ZERO;
+        public AEAmount crafting = AEAmount.ZERO;
     }
 
     /**
@@ -103,6 +107,9 @@ public class CraftingPlanSummary {
      * @param actionSource The action source used to determine the amount of items already stored.
      */
     public static CraftingPlanSummary fromJob(IGrid grid, IActionSource actionSource, ICraftingPlan job) {
+        if (job instanceof ExactCraftingPlanAdapter exact) {
+            return fromExactJob(grid, exact);
+        }
         var plan = new HashMap<AEKey, KeyStats>() {
             private KeyStats mapping(AEKey key) {
                 Objects.requireNonNull(key, "Key may not be null");
@@ -112,19 +119,22 @@ public class CraftingPlanSummary {
         };
 
         for (var used : job.usedItems()) {
-            plan.mapping(used.getKey()).stored += used.getLongValue();
+            var stats = plan.mapping(used.getKey());
+            stats.stored = stats.stored.add(AEAmount.of(used.getLongValue()));
         }
         for (var missing : job.missingItems()) {
-            plan.mapping(missing.getKey()).stored += missing.getLongValue();
+            var stats = plan.mapping(missing.getKey());
+            stats.stored = stats.stored.add(AEAmount.of(missing.getLongValue()));
         }
         for (var emitted : job.emittedItems()) {
             var entry = plan.mapping(emitted.getKey());
-            entry.stored += emitted.getLongValue();
-            entry.crafting += emitted.getLongValue();
+            entry.stored = entry.stored.add(AEAmount.of(emitted.getLongValue()));
+            entry.crafting = entry.crafting.add(AEAmount.of(emitted.getLongValue()));
         }
         for (var entry : job.patternTimes().entrySet()) {
             for (var out : entry.getKey().getOutputs()) {
-                plan.mapping(out.what()).crafting += out.amount() * entry.getValue();
+                var stats = plan.mapping(out.what());
+                stats.crafting = stats.crafting.add(AEAmount.of(out.amount()).multiply(AEAmount.of(entry.getValue())));
             }
         }
 
@@ -138,27 +148,63 @@ public class CraftingPlanSummary {
             long missingAmount;
             long storedAmount;
             if (job.simulation() && !crafting.canEmitFor(out.getKey())) {
-                storedAmount = storage.extract(out.getKey(), out.getValue().stored, Actionable.SIMULATE, actionSource);
-                missingAmount = out.getValue().stored - storedAmount;
+                long requested = out.getValue().stored.longValueExact();
+                storedAmount = storage.extract(out.getKey(), requested, Actionable.SIMULATE, actionSource);
+                missingAmount = requested - storedAmount;
             } else {
-                storedAmount = out.getValue().stored;
+                storedAmount = out.getValue().stored.longValueExact();
                 missingAmount = 0;
             }
-            long craftAmount = out.getValue().crafting;
+            long craftAmount = out.getValue().crafting.longValueExact();
             long availableAmount = cachedInv.get(out.getKey());
 
             entries.add(new CraftingPlanSummaryEntry(
                     out.getKey(),
-                    missingAmount,
-                    storedAmount,
-                    craftAmount,
-                    availableAmount));
+                    AEAmount.of(missingAmount),
+                    AEAmount.of(storedAmount),
+                    AEAmount.of(craftAmount),
+                    AEAmount.of(availableAmount)));
         }
 
         Collections.sort(entries);
 
         return new CraftingPlanSummary(job.bytes(), job.simulation(), List.copyOf(entries));
 
+    }
+
+    private static CraftingPlanSummary fromExactJob(IGrid grid, ExactCraftingPlanAdapter adapter) {
+        var plan = new HashMap<AEKey, KeyStats>();
+        var exact = adapter.exactPlan();
+        exact.initialStorageDebits().forEach(
+                (key, amount) -> plan.computeIfAbsent(adapter.resolve(key), ignored -> new KeyStats()).stored = amount);
+        for (var manifest : exact.executionManifests()) {
+            for (var execution : manifest.patternExecutions()) {
+                for (var output : execution.pattern().outputs()) {
+                    var stats = plan.computeIfAbsent(adapter.resolve(output.key()), ignored -> new KeyStats());
+                    stats.crafting = stats.crafting
+                            .add(output.amountPerExecution().multiply(execution.executions()));
+                }
+            }
+        }
+
+        appeng.rebuild.storage.StorageSnapshot snapshot = null;
+        StorageService exactStorage = grid.getStorageService() instanceof StorageService storage ? storage : null;
+        if (exactStorage != null) {
+            var captured = exactStorage.getExactStorage().captureSnapshot();
+            if (captured instanceof StorageSnapshotCaptureResult.Success success) {
+                snapshot = success.snapshot();
+            }
+        }
+        var entries = new ArrayList<CraftingPlanSummaryEntry>(plan.size());
+        for (var entry : plan.entrySet()) {
+            var keyId = exactStorage == null ? null
+                    : exactStorage.getExactStorage().keyRegistry().lookup(entry.getKey());
+            AEAmount available = snapshot != null && keyId != null ? snapshot.amount(keyId) : AEAmount.ZERO;
+            entries.add(new CraftingPlanSummaryEntry(entry.getKey(), AEAmount.ZERO, entry.getValue().stored,
+                    entry.getValue().crafting, available));
+        }
+        Collections.sort(entries);
+        return new CraftingPlanSummary(adapter.bytes(), false, List.copyOf(entries));
     }
 
 }

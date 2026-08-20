@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 import org.jetbrains.annotations.Nullable;
@@ -73,6 +74,15 @@ import appeng.core.localization.PlayerMessages;
 import appeng.core.settings.TickRates;
 import appeng.helpers.InterfaceLogicHost;
 import appeng.me.helpers.MachineSource;
+import appeng.rebuild.execution.ExactCraftingMachine;
+import appeng.rebuild.execution.ExactCraftingProvider;
+import appeng.rebuild.execution.ExactWorkCommand;
+import appeng.rebuild.pattern.PatternLimits;
+import appeng.rebuild.pattern.PatternProviderRecipeReloadFailure;
+import appeng.rebuild.pattern.PatternProviderRecipeReloadResult;
+import appeng.rebuild.pattern.PreparedPatternProviderRecipeReload;
+import appeng.rebuild.pattern.RebuildPatternClassifier;
+import appeng.rebuild.pattern.RecipeRevision;
 import appeng.util.ConfigManager;
 import appeng.util.inv.AppEngInternalInventory;
 import appeng.util.inv.InternalInventoryHost;
@@ -81,7 +91,7 @@ import appeng.util.inv.PlayerInternalInventory;
 /**
  * Shared code between the pattern provider block and part.
  */
-public class PatternProviderLogic implements InternalInventoryHost, ICraftingProvider {
+public class PatternProviderLogic implements InternalInventoryHost, ICraftingProvider, ExactCraftingProvider {
     private static final Logger LOGGER = LoggerFactory.getLogger(PatternProviderLogic.class);
 
     public static final String NBT_MEMORY_CARD_PATTERNS = "patterns";
@@ -95,18 +105,20 @@ public class PatternProviderLogic implements InternalInventoryHost, ICraftingPro
     private final PatternProviderLogicHost host;
     private final IManagedGridNode mainNode;
     private final IActionSource actionSource;
+    private final Object recipeReloadOwnerToken = new Object();
     private final ConfigManager configManager = new ConfigManager(this::configChanged);
 
     private int priority;
 
     // Pattern storing logic
     private final AppEngInternalInventory patternInventory;
-    private final List<IPatternDetails> patterns = new ArrayList<>();
+    private List<IPatternDetails> patterns = List.of();
     /**
      * Keeps track of the inputs of all the patterns. When blocking mode is enabled, if any of these is contained in the
      * target, the pattern won't be pushed. Always contains keys with the secondary component dropped.
      */
-    private final Set<AEKey> patternInputs = new HashSet<>();
+    private Set<AEKey> patternInputs = Set.of();
+    private long patternStateVersion;
     // Pattern sending logic
     private final List<GenericStack> sendList = new ArrayList<>();
     private Direction sendDirection;
@@ -248,24 +260,217 @@ public class PatternProviderLogic implements InternalInventoryHost, ICraftingPro
     }
 
     public void updatePatterns() {
-        patterns.clear();
-        patternInputs.clear();
+        var updatedPatterns = new ArrayList<IPatternDetails>();
+        var updatedPatternInputs = new HashSet<AEKey>();
 
         for (var stack : this.patternInventory) {
             var details = PatternDetailsHelper.decodePattern(stack, this.host.getBlockEntity().getLevel());
 
             if (details != null) {
-                patterns.add(details);
+                updatedPatterns.add(details);
 
                 for (var iinput : details.getInputs()) {
                     for (var inputCandidate : iinput.getPossibleInputs()) {
-                        patternInputs.add(inputCandidate.what().dropSecondary());
+                        updatedPatternInputs.add(inputCandidate.what().dropSecondary());
                     }
                 }
             }
         }
 
+        replacePatternState(updatedPatterns, updatedPatternInputs);
+
         ICraftingProvider.requestUpdate(mainNode);
+    }
+
+    /**
+     * Stages this provider's legacy pattern data for one exact recipe revision without mutating live provider state.
+     *
+     * <p>
+     * This is server-thread-only. C2B2 can prepare every provider first and invoke
+     * {@link #commitRecipeReload(PreparedPatternProviderRecipeReload, RecipeRevision)} only after all preparations
+     * succeed.
+     */
+    public PatternProviderRecipeReloadResult prepareRecipeReload(RecipeRevision revision) {
+        Objects.requireNonNull(revision, "revision");
+        ServerLevel level = requireServerLevel();
+        long capturedPatternStateVersion = patternStateVersion;
+        int slot = -1;
+        try {
+            int inventorySlots = patternInventory.size();
+            if (inventorySlots > PatternLimits.MAX_PATTERN_PROVIDER_PATTERNS) {
+                return shapeLimitFailure("inventory slots");
+            }
+
+            var stagedPatterns = new ArrayList<IPatternDetails>();
+            var stagedEligibility = new ArrayList<Boolean>();
+            var stagedInputs = new HashSet<AEKey>();
+            int totalCandidates = 0;
+            for (slot = 0; slot < inventorySlots; slot++) {
+                ItemStack stack = patternInventory.getStackInSlot(slot);
+                if (stack == null) {
+                    return malformedFailure(slot, "null stack");
+                }
+                if (stack.isEmpty()) {
+                    continue;
+                }
+
+                IPatternDetails details = PatternDetailsHelper.decodePattern(stack, level, false);
+                if (details == null) {
+                    return malformedFailure(slot, "undecodable pattern");
+                }
+                if (stagedPatterns.size() >= PatternLimits.MAX_PATTERN_PROVIDER_PATTERNS) {
+                    return shapeLimitFailure("patterns");
+                }
+
+                totalCandidates = validateAndCollectPattern(details, slot, stagedInputs, totalCandidates);
+                stagedPatterns.add(details);
+                stagedEligibility.add(isRebuildEligible(details));
+            }
+            return new PreparedPatternProviderRecipeReload(recipeReloadOwnerToken, revision,
+                    capturedPatternStateVersion,
+                    stagedPatterns, stagedEligibility, stagedInputs);
+        } catch (StagingFailureException exception) {
+            return new PatternProviderRecipeReloadFailure(exception.reason, exception.context);
+        } catch (RuntimeException exception) {
+            return new PatternProviderRecipeReloadFailure(PatternProviderRecipeReloadFailure.Reason.LEGACY_EXCEPTION,
+                    boundedSlotContext(slot, "legacy callback"));
+        }
+    }
+
+    /**
+     * Atomically replaces only legacy pattern state from a provider-owned, unconsumed preparation.
+     *
+     * <p>
+     * This intentionally does not request a crafting-provider update or touch grid provider maps; C2B2 publishes the
+     * all-provider transaction after every provider commit succeeds.
+     */
+    public void commitRecipeReload(PreparedPatternProviderRecipeReload prepared, RecipeRevision expectedRevision) {
+        Objects.requireNonNull(prepared, "prepared");
+        Objects.requireNonNull(expectedRevision, "expectedRevision");
+        requireServerLevel();
+        if (!prepared.belongsTo(recipeReloadOwnerToken)) {
+            throw new IllegalArgumentException("Recipe reload preparation belongs to another provider");
+        }
+        if (!prepared.revision().equals(expectedRevision)) {
+            throw new IllegalArgumentException("Recipe reload preparation has a different revision");
+        }
+        if (prepared.patternStateVersion() != patternStateVersion) {
+            throw new IllegalStateException("Recipe reload preparation is stale or already committed");
+        }
+
+        replacePatternState(prepared.legacyPatterns(), prepared.patternInputs());
+    }
+
+    private int validateAndCollectPattern(IPatternDetails details, int slot, Set<AEKey> stagedInputs,
+            int totalCandidates) {
+        if (details.getDefinition() == null) {
+            throw malformed(slot, "null definition");
+        }
+        IPatternDetails.IInput[] inputs = details.getInputs();
+        if (inputs == null || inputs.length > PatternLimits.MAX_INPUT_GROUPS) {
+            throw inputs == null ? malformed(slot, "null inputs") : shapeLimit("input groups");
+        }
+        GenericStack[] outputs = details.getOutputs();
+        if (outputs == null || outputs.length == 0) {
+            throw malformed(slot, "missing outputs");
+        }
+        if (outputs.length > PatternLimits.MAX_OUTPUTS) {
+            throw shapeLimit("outputs");
+        }
+        for (GenericStack output : outputs) {
+            validateStack(output, slot, "output");
+        }
+
+        int patternCandidateCount = 0;
+        for (IPatternDetails.IInput input : inputs) {
+            if (input == null) {
+                throw malformed(slot, "null input");
+            }
+            if (input.getMultiplier() <= 0) {
+                throw malformed(slot, "non-positive input multiplier");
+            }
+            GenericStack[] candidates = input.getPossibleInputs();
+            if (candidates == null || candidates.length == 0) {
+                throw malformed(slot, "missing input candidates");
+            }
+            if (candidates.length > PatternLimits.MAX_CANDIDATES_PER_INPUT) {
+                throw shapeLimit("candidates per input");
+            }
+            for (GenericStack candidate : candidates) {
+                validateStack(candidate, slot, "input candidate");
+                if (patternCandidateCount >= PatternLimits.MAX_TOTAL_CANDIDATES_PER_PATTERN
+                        || totalCandidates >= PatternLimits.MAX_PATTERN_PROVIDER_TOTAL_INPUT_CANDIDATES) {
+                    throw shapeLimit("total input candidates");
+                }
+                patternCandidateCount++;
+                totalCandidates++;
+                AEKey primaryKey = candidate.what().dropSecondary();
+                if (primaryKey == null) {
+                    throw malformed(slot, "null dropped-secondary key");
+                }
+                stagedInputs.add(primaryKey);
+            }
+        }
+        return totalCandidates;
+    }
+
+    private static void validateStack(GenericStack stack, int slot, String description) {
+        if (stack == null || stack.what() == null || stack.amount() <= 0) {
+            throw malformed(slot, "invalid " + description);
+        }
+    }
+
+    private static boolean isRebuildEligible(IPatternDetails details) {
+        return RebuildPatternClassifier.isEligible(details);
+    }
+
+    private ServerLevel requireServerLevel() {
+        Level level = host.getBlockEntity().getLevel();
+        if (!(level instanceof ServerLevel serverLevel) || !serverLevel.getServer().isSameThread()) {
+            throw new IllegalStateException("Recipe reload preparation must run on the owning server thread");
+        }
+        return serverLevel;
+    }
+
+    private void replacePatternState(List<IPatternDetails> replacementPatterns, Set<AEKey> replacementInputs) {
+        List<IPatternDetails> immutablePatterns = List.copyOf(replacementPatterns);
+        Set<AEKey> immutableInputs = Set.copyOf(replacementInputs);
+        long nextPatternStateVersion = Math.incrementExact(patternStateVersion);
+        patterns = immutablePatterns;
+        patternInputs = immutableInputs;
+        patternStateVersion = nextPatternStateVersion;
+    }
+
+    private static PatternProviderRecipeReloadFailure shapeLimitFailure(String context) {
+        return new PatternProviderRecipeReloadFailure(PatternProviderRecipeReloadFailure.Reason.SHAPE_LIMIT, context);
+    }
+
+    private static PatternProviderRecipeReloadFailure malformedFailure(int slot, String context) {
+        return new PatternProviderRecipeReloadFailure(PatternProviderRecipeReloadFailure.Reason.MALFORMED_PATTERN,
+                boundedSlotContext(slot, context));
+    }
+
+    private static StagingFailureException malformed(int slot, String context) {
+        return new StagingFailureException(PatternProviderRecipeReloadFailure.Reason.MALFORMED_PATTERN,
+                boundedSlotContext(slot, context));
+    }
+
+    private static StagingFailureException shapeLimit(String context) {
+        return new StagingFailureException(PatternProviderRecipeReloadFailure.Reason.SHAPE_LIMIT, context);
+    }
+
+    private static String boundedSlotContext(int slot, String context) {
+        return slot < 0 ? context : "slot " + slot + ": " + context;
+    }
+
+    private static final class StagingFailureException extends RuntimeException {
+        private final PatternProviderRecipeReloadFailure.Reason reason;
+        private final String context;
+
+        private StagingFailureException(PatternProviderRecipeReloadFailure.Reason reason, String context) {
+            this.reason = reason;
+            this.context = context;
+        }
     }
 
     @Override
@@ -367,6 +572,29 @@ public class PatternProviderLogic implements InternalInventoryHost, ICraftingPro
         }
 
         return false;
+    }
+
+    @Override
+    public boolean pushExactPattern(ExactWorkCommand command, IPatternDetails patternDetails,
+            KeyCounter[] inputHolder) {
+        Objects.requireNonNull(command, "command");
+        if (!sendList.isEmpty() || !this.mainNode.isActive() || !this.patterns.contains(patternDetails)
+                || getCraftingLockedReason() != LockCraftingMode.NONE) {
+            return false;
+        }
+        var be = host.getBlockEntity();
+        var level = be.getLevel();
+        for (var direction : getActiveSides()) {
+            var adjPos = be.getBlockPos().relative(direction);
+            var adjBeSide = direction.getOpposite();
+            var craftingMachine = ICraftingMachine.of(level, adjPos, adjBeSide, level.getBlockEntity(adjPos));
+            if (craftingMachine instanceof ExactCraftingMachine exactMachine && craftingMachine.acceptsPlans()
+                    && exactMachine.pushExactPattern(command, patternDetails, inputHolder, adjBeSide)) {
+                onPushPatternSuccess(patternDetails);
+                return true;
+            }
+        }
+        return pushPattern(patternDetails, inputHolder);
     }
 
     public void resetCraftingLock() {

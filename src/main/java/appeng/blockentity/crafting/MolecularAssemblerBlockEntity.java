@@ -18,7 +18,9 @@
 
 package appeng.blockentity.crafting;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -73,19 +75,31 @@ import appeng.core.sync.network.NetworkHandler;
 import appeng.core.sync.network.TargetPoint;
 import appeng.core.sync.packets.AssemblerAnimationPacket;
 import appeng.crafting.CraftingEvent;
+import appeng.me.service.CraftingService;
 import appeng.menu.AutoCraftingMenu;
+import appeng.rebuild.execution.ExactCraftingMachine;
+import appeng.rebuild.execution.ExactPlanId;
+import appeng.rebuild.execution.ExactWorkCommand;
+import appeng.rebuild.execution.WorkCommandId;
+import appeng.rebuild.execution.WorkOrderId;
+import appeng.rebuild.quantity.AEAmount;
 import appeng.util.inv.AppEngInternalInventory;
 import appeng.util.inv.CombinedInternalInventory;
 import appeng.util.inv.FilteredInternalInventory;
 import appeng.util.inv.filter.IAEItemFilter;
 
 public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
-        implements IUpgradeableObject, IGridTickable, ICraftingMachine, IPowerChannelState {
+        implements IUpgradeableObject, IGridTickable, ICraftingMachine, IPowerChannelState, ExactCraftingMachine {
 
     /**
      * Identifies the sub-inventory used by molecular assemblers to store the input items for the crafting process.
      */
     public static final ResourceLocation INV_MAIN = AppEng.makeId("molecular_assembler");
+    private static final String EXACT_COMMAND = "ae2RebuildExactCommand";
+    private static final String EXACT_PLAN = "plan";
+    private static final String EXACT_LEASE = "lease";
+    private static final String EXACT_WORK_ORDER = "workOrder";
+    private static final String EXACT_GENERATION = "generation";
 
     private final CraftingContainer craftingInv;
     private final AppEngInternalInventory gridInv = new AppEngInternalInventory(this, 9 + 1, 1);
@@ -101,6 +115,8 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
     private boolean isAwake = false;
     private boolean forcePlan = false;
     private boolean reboot = true;
+    @Nullable
+    private WorkCommandId exactCommandId;
 
     @OnlyIn(Dist.CLIENT)
     private AssemblerAnimationStatus animationStatus;
@@ -149,7 +165,18 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
     @Override
     public boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] table,
             Direction where) {
-        if (this.myPattern.isEmpty()) {
+        return acceptPattern(null, patternDetails, table, where);
+    }
+
+    @Override
+    public boolean pushExactPattern(ExactWorkCommand command, IPatternDetails patternDetails, KeyCounter[] inputs,
+            Direction ejectionDirection) {
+        return acceptPattern(command.id(), patternDetails, inputs, ejectionDirection);
+    }
+
+    private boolean acceptPattern(@Nullable WorkCommandId commandId, IPatternDetails patternDetails,
+            KeyCounter[] table, Direction where) {
+        if (this.myPattern.isEmpty() && this.exactCommandId == null) {
             boolean isEmpty = this.gridInv.isEmpty() && this.patternInv.isEmpty();
 
             // Only accept our own crafting patterns!
@@ -159,6 +186,7 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
                 this.forcePlan = true;
                 this.myPlan = pattern;
                 this.pushDirection = where;
+                this.exactCommandId = commandId;
 
                 this.fillGrid(table, pattern);
 
@@ -244,6 +272,14 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
                 data.putInt("pushDirection", this.pushDirection.ordinal());
             }
         }
+        if (exactCommandId != null) {
+            CompoundTag command = new CompoundTag();
+            command.putUUID(EXACT_PLAN, exactCommandId.planId().value());
+            command.putUUID(EXACT_LEASE, exactCommandId.leaseIdentity());
+            command.putUUID(EXACT_WORK_ORDER, exactCommandId.workOrderId().value());
+            command.putLong(EXACT_GENERATION, exactCommandId.generation());
+            data.put(EXACT_COMMAND, command);
+        }
 
         this.upgrades.writeToNBT(data, "upgrades");
     }
@@ -256,6 +292,7 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
         this.forcePlan = false;
         this.myPattern = ItemStack.EMPTY;
         this.myPlan = null;
+        this.exactCommandId = decodeExactCommand(data);
 
         if (data.contains("myPlan")) {
             var pattern = ItemStack.of(data.getCompound("myPlan"));
@@ -436,11 +473,17 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
 
                 // pushOut might reset the plan back to null, so get the remaining items before
                 var craftingRemainders = this.myPlan.getRemainingItems(this.craftingInv);
-
-                this.pushOut(output.copy());
-
-                for (int x = 0; x < this.craftingInv.getContainerSize(); x++) {
-                    this.gridInv.setItemDirect(x, craftingRemainders.get(x));
+                boolean completedExact = completeExactResult(output, craftingRemainders);
+                if (completedExact) {
+                    for (int x = 0; x < this.craftingInv.getContainerSize(); x++) {
+                        this.gridInv.setItemDirect(x, ItemStack.EMPTY);
+                    }
+                    exactCommandId = null;
+                } else {
+                    this.pushOut(output.copy());
+                    for (int x = 0; x < this.craftingInv.getContainerSize(); x++) {
+                        this.gridInv.setItemDirect(x, craftingRemainders.get(x));
+                    }
                 }
 
                 if (this.patternInv.isEmpty()) {
@@ -510,6 +553,53 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
         }
 
         this.gridInv.setItemDirect(9, output);
+    }
+
+    private boolean completeExactResult(ItemStack output, List<ItemStack> craftingRemainders) {
+        WorkCommandId commandId = exactCommandId;
+        if (commandId == null) {
+            return false;
+        }
+        var grid = getMainNode().getGrid();
+        if (grid == null || !(grid.getCraftingService() instanceof CraftingService service)) {
+            return false;
+        }
+        Map<appeng.api.stacks.AEKey, AEAmount> outputs = new LinkedHashMap<>();
+        Map<appeng.api.stacks.AEKey, AEAmount> remainders = new LinkedHashMap<>();
+        if (!addExactResult(outputs, output)) {
+            return false;
+        }
+        for (ItemStack remainder : craftingRemainders) {
+            if (!remainder.isEmpty() && !addExactResult(remainders, remainder)) {
+                return false;
+            }
+        }
+        return service.completeExactCommandResult(commandId, outputs, remainders);
+    }
+
+    private static boolean addExactResult(Map<appeng.api.stacks.AEKey, AEAmount> target, ItemStack stack) {
+        var key = AEItemKey.of(stack);
+        if (key == null || stack.getCount() <= 0) {
+            return false;
+        }
+        target.merge(key, AEAmount.of(stack.getCount()), AEAmount::add);
+        return true;
+    }
+
+    @Nullable
+    private static WorkCommandId decodeExactCommand(CompoundTag data) {
+        if (!data.contains(EXACT_COMMAND, net.minecraft.nbt.Tag.TAG_COMPOUND)) {
+            return null;
+        }
+        CompoundTag command = data.getCompound(EXACT_COMMAND);
+        if (command.size() != 4 || !command.hasUUID(EXACT_PLAN) || !command.hasUUID(EXACT_LEASE)
+                || !command.hasUUID(EXACT_WORK_ORDER)
+                || !command.contains(EXACT_GENERATION, net.minecraft.nbt.Tag.TAG_LONG)
+                || command.getLong(EXACT_GENERATION) < 0) {
+            throw new IllegalStateException("malformed exact molecular assembler command identity");
+        }
+        return new WorkCommandId(new ExactPlanId(command.getUUID(EXACT_PLAN)), command.getUUID(EXACT_LEASE),
+                new WorkOrderId(command.getUUID(EXACT_WORK_ORDER)), command.getLong(EXACT_GENERATION));
     }
 
     private ItemStack pushTo(ItemStack output, Direction d) {
@@ -604,6 +694,11 @@ public class MolecularAssemblerBlockEntity extends AENetworkInvBlockEntity
         } else {
             return myPlan;
         }
+    }
+
+    /** Read-only server-thread recovery probe; possessing an id cannot acknowledge or complete the command. */
+    public boolean retainsExactCommand(WorkCommandId commandId) {
+        return commandId != null && commandId.equals(exactCommandId);
     }
 
     private class CraftingGridFilter implements IAEItemFilter {

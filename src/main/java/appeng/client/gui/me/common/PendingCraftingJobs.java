@@ -25,6 +25,8 @@ import appeng.core.localization.GuiText;
 import appeng.core.localization.PlayerMessages;
 import appeng.core.sync.packets.CraftingJobStatusPacket;
 import appeng.items.tools.powered.WirelessTerminalItem;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.quantity.AEAmount;
 import appeng.util.NumberUtil;
 import appeng.util.SearchInventoryEvent;
 
@@ -58,6 +60,15 @@ public final class PendingCraftingJobs {
             long remainingAmount,
             long elapsedTime,
             CraftingJobStatusPacket.Status status) {
+        jobStatus(id, what, AEAmount.of(requestedAmount), AEAmount.of(remainingAmount), elapsedTime, status);
+    }
+
+    public static void jobStatus(UUID id,
+            AEKey what,
+            AEAmount requestedAmount,
+            AEAmount remainingAmount,
+            long elapsedTime,
+            CraftingJobStatusPacket.Status status) {
 
         AELog.debug("Crafting job " + id + " for " + requestedAmount
                 + "x" + AEKeyRendering.getDisplayName(what).getString() + ". State=" + status);
@@ -77,12 +88,15 @@ public final class PendingCraftingJobs {
                 var minecraft = Minecraft.getInstance();
                 if (AEConfig.instance().isNotifyForFinishedCraftingJobs()
                         && minecraft.player != null && hasNotificationEnablingItem(minecraft.player)) {
-                    var amount = Component.literal(NumberUtil.formatNumber(requestedAmount))
+                    var projected = LegacyAmountProjection.project(requestedAmount);
+                    var amount = Component.literal(projected.saturated()
+                            ? requestedAmount.toString()
+                            : NumberUtil.formatNumber(projected.amount()))
                             .withStyle(ChatFormatting.GREEN)
                             .withStyle(style -> style.withHoverEvent(
                                     new HoverEvent(
                                             HoverEvent.Action.SHOW_TEXT,
-                                            GuiText.HoverAmount.text(requestedAmount))));
+                                            GuiText.HoverAmount.text(requestedAmount.toString()))));
                     var displayName = what.getDisplayName().copy()
                             .withStyle(ChatFormatting.AQUA)
                             .withStyle(style -> style.withHoverEvent(
@@ -99,7 +113,7 @@ public final class PendingCraftingJobs {
                             duration));
                     minecraft.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 1.0f, 1.0f);
                     if (!(minecraft.screen instanceof MEStorageScreen<?>)) {
-                        minecraft.getToasts().addToast(new FinishedJobToast(what, requestedAmount));
+                        minecraft.getToasts().addToast(new FinishedJobToast(what, projected.amount()));
                     }
                 }
             }
@@ -120,6 +134,6 @@ public final class PendingCraftingJobs {
         return false;
     }
 
-    record PendingJob(UUID jobId, AEKey what, long requestedAmount, long remainingAmount) {
+    record PendingJob(UUID jobId, AEKey what, AEAmount requestedAmount, AEAmount remainingAmount) {
     }
 }

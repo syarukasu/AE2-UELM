@@ -51,6 +51,7 @@ import appeng.core.sync.packets.CraftConfirmPlanPacket;
 import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.helpers.IMenuCraftingPacket;
 import appeng.me.helpers.PlayerSource;
+import appeng.me.service.CraftingService;
 import appeng.menu.AEBaseMenu;
 import appeng.menu.ISubMenu;
 import appeng.menu.MenuOpener;
@@ -58,6 +59,7 @@ import appeng.menu.guisync.GuiSync;
 import appeng.menu.guisync.PacketWritable;
 import appeng.menu.implementations.MenuTypeBuilder;
 import appeng.menu.locator.MenuLocator;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * @see appeng.client.gui.me.crafting.CraftConfirmScreen
@@ -79,7 +81,7 @@ public class CraftConfirmMenu extends AEBaseMenu implements ISubMenu {
     private ICraftingCPU selectedCpu;
 
     private AEKey whatToCraft;
-    private long amount;
+    private AEAmount amount = AEAmount.ZERO;
     private Future<ICraftingPlan> job;
     private ICraftingPlan result;
 
@@ -164,6 +166,10 @@ public class CraftConfirmMenu extends AEBaseMenu implements ISubMenu {
     }
 
     public boolean planJob(AEKey what, long amount, CalculationStrategy strategy) {
+        return planExactJob(what, AEAmount.of(amount), strategy);
+    }
+
+    public boolean planExactJob(AEKey what, AEAmount amount, CalculationStrategy strategy) {
         if (this.job != null) {
             this.job.cancel(true);
         }
@@ -181,13 +187,16 @@ public class CraftConfirmMenu extends AEBaseMenu implements ISubMenu {
         }
 
         var cg = grid.getCraftingService();
-
-        this.job = cg.beginCraftingCalculation(
-                player.level(),
-                this::getActionSrc,
-                what,
-                amount,
-                strategy);
+        if (cg instanceof CraftingService exact) {
+            this.job = exact.beginCraftingCalculationExact(player.level(), this::getActionSrc, what, amount, strategy);
+        } else {
+            try {
+                this.job = cg.beginCraftingCalculation(player.level(), this::getActionSrc, what,
+                        amount.longValueExact(), strategy);
+            } catch (ArithmeticException unsupportedExactAmount) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -392,7 +401,7 @@ public class CraftConfirmMenu extends AEBaseMenu implements ISubMenu {
         }
 
         if (whatToCraft != null) {
-            if (!planJob(whatToCraft, amount, CalculationStrategy.CRAFT_LESS)) {
+            if (!planExactJob(whatToCraft, amount, CalculationStrategy.CRAFT_LESS)) {
                 goBack();
             }
         } else {

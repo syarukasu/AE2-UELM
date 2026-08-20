@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.TreeMap;
 
 import com.google.common.base.Preconditions;
@@ -42,12 +43,22 @@ import appeng.core.localization.GuiText;
  */
 public class NetworkStorage implements MEStorage {
     private static final Comparator<Integer> PRIORITY_SORTER = (o1, o2) -> Integer.compare(o2, o1);
+    private static final NetworkStorageMountObserver NO_OP_OBSERVER = new NetworkStorageMountObserver() {
+        @Override
+        public void mounted(int priority, MEStorage storage) {
+        }
+
+        @Override
+        public void unmounted(int priority, MEStorage storage) {
+        }
+    };
 
     // This flag prevents both concurrent modifications of the mounted storage while
     // they're being iterated, and recursive extract/insert/list operations.
     private boolean mountsInUse;
 
     private final NavigableMap<Integer, List<MEStorage>> priorityInventory;
+    private final NetworkStorageMountObserver mountObserver;
     private final List<MEStorage> secondPassInventories = new ArrayList<>();
 
     // Queued mount/unmount operations that occurred while an insert/extract was ongoing
@@ -56,10 +67,16 @@ public class NetworkStorage implements MEStorage {
     private List<QueuedOperation> queuedOperations;
 
     public NetworkStorage() {
+        this(NO_OP_OBSERVER);
+    }
+
+    public NetworkStorage(NetworkStorageMountObserver mountObserver) {
+        this.mountObserver = Objects.requireNonNull(mountObserver, "mountObserver");
         this.priorityInventory = new TreeMap<>(PRIORITY_SORTER);
     }
 
     public void mount(int priority, MEStorage inventory) {
+        Objects.requireNonNull(inventory, "inventory");
         if (mountsInUse) {
             if (queuedOperations == null) {
                 queuedOperations = new ArrayList<>();
@@ -68,10 +85,12 @@ public class NetworkStorage implements MEStorage {
         } else {
             this.priorityInventory.computeIfAbsent(priority, k -> new ArrayList<>())
                     .add(inventory);
+            mountObserver.mounted(priority, inventory);
         }
     }
 
     public void unmount(MEStorage inventory) {
+        Objects.requireNonNull(inventory, "inventory");
         if (mountsInUse) {
             if (queuedOperations == null) {
                 queuedOperations = new ArrayList<>();
@@ -83,8 +102,21 @@ public class NetworkStorage implements MEStorage {
                 var prioEntry = prioIt.next();
 
                 var inventories = prioEntry.getValue();
-                if (inventories.remove(inventory) && inventories.isEmpty()) {
-                    prioIt.remove();
+                MEStorage removedInventory = null;
+                var inventoryIt = inventories.iterator();
+                while (inventoryIt.hasNext()) {
+                    var mountedInventory = inventoryIt.next();
+                    if (Objects.equals(inventory, mountedInventory)) {
+                        inventoryIt.remove();
+                        removedInventory = mountedInventory;
+                        break;
+                    }
+                }
+                if (removedInventory != null) {
+                    mountObserver.unmounted(prioEntry.getKey(), removedInventory);
+                    if (inventories.isEmpty()) {
+                        prioIt.remove();
+                    }
                 }
             }
         }

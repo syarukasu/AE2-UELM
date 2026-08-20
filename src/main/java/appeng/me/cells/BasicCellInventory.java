@@ -18,18 +18,19 @@
 
 package appeng.me.cells;
 
+import java.math.BigInteger;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
-
-import it.unimi.dsi.fastutil.longs.LongArrayList;
-import it.unimi.dsi.fastutil.objects.Object2LongMap;
-import it.unimi.dsi.fastutil.objects.Object2LongMaps;
-import it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap;
+import net.minecraftforge.server.ServerLifecycleHooks;
 
 import appeng.api.config.Actionable;
 import appeng.api.config.FuzzyMode;
@@ -47,15 +48,25 @@ import appeng.api.storage.cells.StorageCell;
 import appeng.api.upgrades.IUpgradeInventory;
 import appeng.core.AELog;
 import appeng.core.definitions.AEItems;
+import appeng.rebuild.cell.ExactCellCapacityProvider;
+import appeng.rebuild.cell.ExactCellDescriptor;
+import appeng.rebuild.cell.ExactCellId;
+import appeng.rebuild.cell.ExactCellSnapshot;
+import appeng.rebuild.cell.ExactCellStorageManager;
+import appeng.rebuild.persistence.AEAmountNbtCodec;
+import appeng.rebuild.persistence.PersistenceDecodeResult;
+import appeng.rebuild.quantity.AEAmount;
+import appeng.rebuild.storage.ExactMountedStorage;
 import appeng.util.ConfigInventory;
 import appeng.util.prioritylist.FuzzyPriorityList;
 import appeng.util.prioritylist.IPartitionList;
 
-public class BasicCellInventory implements StorageCell {
+public class BasicCellInventory implements StorageCell, ExactMountedStorage {
     private static final int MAX_ITEM_TYPES = 63;
     private static final String ITEM_COUNT_TAG = "ic";
     private static final String STACK_KEYS = "keys";
     private static final String STACK_AMOUNTS = "amts";
+    private static final int MAX_TOOLTIP_PREVIEW = 16;
 
     private final ISaveProvider container;
     private final AEKeyType keyType;
@@ -63,13 +74,17 @@ public class BasicCellInventory implements StorageCell {
     private final IncludeExclude partitionListMode;
     private int maxItemTypes;
     private short storedItems;
-    private long storedItemCount;
-    private Object2LongMap<AEKey> storedAmounts;
+    private AEAmount storedItemCount;
+    private Map<AEKey, AEAmount> storedAmounts;
     private final ItemStack i;
     private final IBasicCellItem cellType;
-    private final long maxItemsPerType; // max items per type, basically infinite unless there is a distribution card.
+    private final AEAmount maxItemsPerType;
     private final boolean hasVoidUpgrade;
     private boolean isPersisted = true;
+    private ExactCellId exactCellId;
+    private long exactCellRevision;
+    private boolean exactMountRejected;
+    private Object exactMountToken;
 
     private BasicCellInventory(IBasicCellItem cellType, ItemStack o, ISaveProvider container) {
         this.i = o;
@@ -84,8 +99,8 @@ public class BasicCellInventory implements StorageCell {
         }
 
         this.container = container;
-        this.storedItems = (short) getTag().getLongArray(STACK_AMOUNTS).length;
-        this.storedItemCount = getTag().getLong(ITEM_COUNT_TAG);
+        this.storedItems = readStoredItemTypesSummary();
+        this.storedItemCount = readStoredItemCountSummary();
         this.storedAmounts = null;
         this.keyType = cellType.getKeyType();
 
@@ -115,11 +130,15 @@ public class BasicCellInventory implements StorageCell {
             }
             maxTypes = Math.min(maxTypes, this.maxItemTypes);
 
-            long totalStorage = (getTotalBytes() - getBytesPerType() * maxTypes) * keyType.getAmountPerByte();
-            // Technically not exactly evenly distributed, but close enough!
-            this.maxItemsPerType = Math.max(0, (totalStorage + maxTypes - 1) / maxTypes);
+            BigInteger totalStorage = getExactTotalItemCapacity().toBigInteger()
+                    .subtract(BigInteger.valueOf(getBytesPerType())
+                            .multiply(BigInteger.valueOf(maxTypes))
+                            .multiply(BigInteger.valueOf(keyType.getAmountPerByte())))
+                    .max(BigInteger.ZERO);
+            this.maxItemsPerType = AEAmount.of(totalStorage.add(BigInteger.valueOf(maxTypes - 1))
+                    .divide(BigInteger.valueOf(maxTypes)));
         } else {
-            this.maxItemsPerType = Long.MAX_VALUE;
+            this.maxItemsPerType = AEAmount.of(BigInteger.ONE.shiftLeft(65_536).subtract(BigInteger.ONE));
         }
 
         this.hasVoidUpgrade = upgrades.isInstalled(AEItems.VOID_CARD);
@@ -177,10 +196,20 @@ public class BasicCellInventory implements StorageCell {
         return cellType.storableInStorageCell() || getAvailableStacks().isEmpty();
     }
 
-    protected Object2LongMap<AEKey> getCellItems() {
+    protected Map<AEKey, AEAmount> getCellItems() {
         if (this.storedAmounts == null) {
-            this.storedAmounts = new Object2LongOpenHashMap<>();
+            this.storedAmounts = new LinkedHashMap<>();
             this.loadCellItems();
+        } else if (isPersisted && exactCellId != null) {
+            ExactCellStorageManager manager = currentManager();
+            if (manager != null) {
+                ExactCellSnapshot snapshot = manager.snapshot(exactCellId);
+                if (snapshot.revision() != exactCellRevision) {
+                    storedAmounts = new LinkedHashMap<>(snapshot.amounts());
+                    exactCellRevision = snapshot.revision();
+                    recalculateSummaries();
+                }
+            }
         }
 
         return this.storedAmounts;
@@ -191,61 +220,45 @@ public class BasicCellInventory implements StorageCell {
         if (this.isPersisted) {
             return;
         }
-
-        long itemCount = 0;
-
-        // add new pretty stuff...
-        var amounts = new LongArrayList(storedAmounts.size());
-        var keys = new ListTag();
-
-        for (var entry : this.storedAmounts.object2LongEntrySet()) {
-            long amount = entry.getLongValue();
-
-            if (amount > 0) {
-                itemCount += amount;
-                keys.add(entry.getKey().toTagGeneric());
-                amounts.add(amount);
-            }
-        }
-
-        if (keys.isEmpty()) {
-            getTag().remove(STACK_KEYS);
-            getTag().remove(STACK_AMOUNTS);
+        recalculateSummaries();
+        ExactCellStorageManager manager = currentManager();
+        if (manager != null) {
+            ExactCellId id = ensureExactCellIdentity(manager);
+            ExactCellSnapshot snapshot = manager.replace(id, storedAmounts);
+            exactCellRevision = snapshot.revision();
+            writeExactItemSummary(id);
         } else {
-            getTag().put(STACK_KEYS, keys);
-            getTag().putLongArray(STACK_AMOUNTS, amounts.toArray(new long[0]));
+            persistLegacyFallback();
         }
-
-        this.storedItems = (short) this.storedAmounts.size();
-
-        this.storedItemCount = itemCount;
-        if (itemCount == 0) {
-            getTag().remove(ITEM_COUNT_TAG);
-        } else {
-            getTag().putLong(ITEM_COUNT_TAG, itemCount);
-        }
-
-        this.isPersisted = true;
+        isPersisted = true;
     }
 
     protected void saveChanges() {
-        // recalculate values
-        this.storedItems = (short) this.storedAmounts.size();
-        this.storedItemCount = 0;
-        for (var storedAmount : this.storedAmounts.values()) {
-            this.storedItemCount += storedAmount;
-        }
-
+        recalculateSummaries();
         this.isPersisted = false;
+        if (currentManager() != null) {
+            persist();
+        }
         if (this.container != null) {
             this.container.saveChanges();
-        } else {
-            // if there is no ISaveProvider, store to NBT immediately
+        } else if (!this.isPersisted) {
             this.persist();
         }
     }
 
     private void loadCellItems() {
+        ExactCellStorageManager manager = currentManager();
+        if (hasExactCellId()) {
+            if (manager == null) {
+                return;
+            }
+            exactCellId = new ExactCellId(getTag().getUUID(ExactCellStorageManager.CELL_ID_TAG));
+            ExactCellSnapshot snapshot = manager.snapshot(exactCellId);
+            exactCellRevision = snapshot.revision();
+            storedAmounts.putAll(snapshot.amounts());
+            recalculateSummaries();
+            return;
+        }
         boolean corruptedTag = false;
 
         var amounts = getTag().getLongArray(STACK_AMOUNTS);
@@ -262,7 +275,7 @@ public class BasicCellInventory implements StorageCell {
             if (amount <= 0 || key == null) {
                 corruptedTag = true;
             } else {
-                storedAmounts.put(key, amount);
+                storedAmounts.put(key, AEAmount.of(amount));
             }
         }
 
@@ -273,8 +286,11 @@ public class BasicCellInventory implements StorageCell {
 
     @Override
     public void getAvailableStacks(KeyCounter out) {
-        for (var entry : Object2LongMaps.fastIterable(this.getCellItems())) {
-            out.add(entry.getKey(), entry.getLongValue());
+        if (exactMountRejected) {
+            return;
+        }
+        for (var entry : getCellItems().entrySet()) {
+            out.add(entry.getKey(), projectLong(entry.getValue()));
         }
     }
 
@@ -300,10 +316,8 @@ public class BasicCellInventory implements StorageCell {
     }
 
     public boolean canHoldNewItem() {
-        final long bytesFree = this.getFreeBytes();
-        return (bytesFree > this.getBytesPerType()
-                || bytesFree == this.getBytesPerType() && this.getUnusedItemCount() > 0)
-                && this.getRemainingItemTypes() > 0;
+        AEAmount typeCost = AEAmount.of((long) getBytesPerType() * keyType.getAmountPerByte());
+        return getExactRemainingItemCount().compareTo(typeCost) > 0 && getRemainingItemTypes() > 0;
     }
 
     public long getTotalBytes() {
@@ -311,7 +325,7 @@ public class BasicCellInventory implements StorageCell {
     }
 
     public long getFreeBytes() {
-        return this.getTotalBytes() - this.getUsedBytes();
+        return Math.max(0, this.getTotalBytes() - this.getUsedBytes());
     }
 
     public long getTotalItemTypes() {
@@ -319,31 +333,96 @@ public class BasicCellInventory implements StorageCell {
     }
 
     public long getStoredItemCount() {
-        return this.storedItemCount;
+        getCellItems();
+        return projectLong(storedItemCount);
+    }
+
+    public AEAmount getExactStoredItemCount() {
+        getCellItems();
+        return storedItemCount;
+    }
+
+    /** Exact bounded item-NBT preview used when the server-owned UUID database is unavailable on the client. */
+    public Map<AEKey, AEAmount> getExactTooltipContents() {
+        if (currentManager() != null || !hasExactCellId()) {
+            return Map.copyOf(getCellItems());
+        }
+        ListTag preview = getTag().getList(ExactCellStorageManager.CELL_PREVIEW_TAG, Tag.TAG_COMPOUND);
+        if (preview.size() > MAX_TOOLTIP_PREVIEW) {
+            return Map.of();
+        }
+        Map<AEKey, AEAmount> result = new LinkedHashMap<>();
+        try {
+            for (int index = 0; index < preview.size(); index++) {
+                CompoundTag entry = preview.getCompound(index);
+                if (entry.size() != 2 || !entry.contains("key", Tag.TAG_COMPOUND)
+                        || !entry.contains("amount", Tag.TAG_COMPOUND)) {
+                    return Map.of();
+                }
+                AEKey key = AEKey.fromTagGeneric(entry.getCompound("key"));
+                PersistenceDecodeResult<AEAmount> decoded = AEAmountNbtCodec.decode(entry.getCompound("amount"));
+                if (key == null || !(decoded instanceof PersistenceDecodeResult.Success<AEAmount> success)
+                        || success.value().equals(AEAmount.ZERO) || result.put(key, success.value()) != null) {
+                    return Map.of();
+                }
+            }
+        } catch (RuntimeException ignored) {
+            return Map.of();
+        }
+        return Map.copyOf(result);
     }
 
     public long getStoredItemTypes() {
+        getCellItems();
         return this.storedItems;
     }
 
     public long getRemainingItemTypes() {
-        var basedOnStorage = this.getFreeBytes() / this.getBytesPerType();
+        long basedOnStorage;
+        if (getBytesPerType() == 0) {
+            basedOnStorage = getTotalItemTypes();
+        } else {
+            BigInteger typeCost = BigInteger.valueOf(getBytesPerType())
+                    .multiply(BigInteger.valueOf(keyType.getAmountPerByte()));
+            basedOnStorage = getExactRemainingItemCount().toBigInteger().divide(typeCost)
+                    .min(BigInteger.valueOf(Long.MAX_VALUE)).longValueExact();
+        }
         var baseOnTotal = this.getTotalItemTypes() - this.getStoredItemTypes();
         return Math.min(basedOnStorage, baseOnTotal);
     }
 
     public long getUsedBytes() {
-        var bytesForItemCount = (this.getStoredItemCount() + this.getUnusedItemCount()) / keyType.getAmountPerByte();
-        return this.getStoredItemTypes() * this.getBytesPerType() + bytesForItemCount;
+        getCellItems();
+        BigInteger amountPerByte = BigInteger.valueOf(keyType.getAmountPerByte());
+        BigInteger bytesForItemCount = storedItemCount.toBigInteger().add(amountPerByte).subtract(BigInteger.ONE)
+                .divide(amountPerByte);
+        BigInteger used = BigInteger.valueOf(getStoredItemTypes()).multiply(BigInteger.valueOf(getBytesPerType()))
+                .add(bytesForItemCount);
+        return used.min(BigInteger.valueOf(Long.MAX_VALUE)).longValueExact();
     }
 
     public long getRemainingItemCount() {
-        final long remaining = this.getFreeBytes() * keyType.getAmountPerByte() + this.getUnusedItemCount();
-        return remaining > 0 ? remaining : 0;
+        return projectLong(getExactRemainingItemCount());
+    }
+
+    public AEAmount getExactRemainingItemCount() {
+        getCellItems();
+        BigInteger totalCapacity = getExactTotalItemCapacity().toBigInteger();
+        BigInteger typeOverhead = BigInteger.valueOf(getStoredItemTypes())
+                .multiply(BigInteger.valueOf(getBytesPerType()))
+                .multiply(BigInteger.valueOf(keyType.getAmountPerByte()));
+        BigInteger remaining = totalCapacity.subtract(typeOverhead).subtract(storedItemCount.toBigInteger());
+        return AEAmount.of(remaining.max(BigInteger.ZERO));
+    }
+
+    public AEAmount getExactTotalItemCapacity() {
+        return ExactCellCapacityProvider.capacityOf(cellType, i);
     }
 
     public int getUnusedItemCount() {
-        final int div = (int) (this.getStoredItemCount() % keyType.getAmountPerByte());
+        getCellItems();
+        final int div = storedItemCount.toBigInteger().mod(BigInteger.valueOf(keyType.getAmountPerByte()))
+                .intValueExact();
 
         if (div == 0) {
             return 0;
@@ -368,7 +447,7 @@ public class BasicCellInventory implements StorageCell {
 
     @Override
     public long insert(AEKey what, long amount, Actionable mode, IActionSource source) {
-        if (amount == 0 || !keyType.contains(what)) {
+        if (exactMountRejected || amount == 0 || !keyType.contains(what)) {
             return 0;
         }
 
@@ -404,59 +483,233 @@ public class BasicCellInventory implements StorageCell {
             }
         }
 
-        var currentAmount = this.getCellItems().getLong(what);
-        long remainingItemCount = this.getRemainingItemCount();
+        AEAmount currentAmount = getCellItems().getOrDefault(what, AEAmount.ZERO);
+        AEAmount remainingItemCount = getExactRemainingItemCount();
 
         // Deduct the required storage for a new type if the type is new
-        if (currentAmount <= 0) {
+        if (currentAmount.equals(AEAmount.ZERO)) {
             if (!canHoldNewItem()) {
                 // No space for more types
                 return 0;
             }
 
-            remainingItemCount -= (long) this.getBytesPerType() * keyType.getAmountPerByte();
-            if (remainingItemCount <= 0) {
+            remainingItemCount = remainingItemCount
+                    .subtractExact(AEAmount.of((long) getBytesPerType() * keyType.getAmountPerByte()));
+            if (remainingItemCount.equals(AEAmount.ZERO)) {
                 return 0;
             }
         }
 
         // Apply max items per type
-        remainingItemCount = Math.max(0, Math.min(this.maxItemsPerType - currentAmount, remainingItemCount));
-
-        if (amount > remainingItemCount) {
-            amount = remainingItemCount;
-        }
+        AEAmount perTypeRemaining = maxItemsPerType.compareTo(currentAmount) > 0
+                ? maxItemsPerType.subtractExact(currentAmount)
+                : AEAmount.ZERO;
+        AEAmount inserted = AEAmount.of(amount).min(remainingItemCount).min(perTypeRemaining);
 
         if (mode == Actionable.MODULATE) {
-            getCellItems().put(what, currentAmount + amount);
+            if (!inserted.equals(AEAmount.ZERO)) {
+                getCellItems().put(what, currentAmount.add(inserted));
+            }
             this.saveChanges();
         }
 
-        return amount;
+        return inserted.longValueExact();
     }
 
     @Override
     public long extract(AEKey what, long amount, Actionable mode, IActionSource source) {
-        var currentAmount = getCellItems().getLong(what);
-        if (currentAmount > 0) {
-            if (amount >= currentAmount) {
-                if (mode == Actionable.MODULATE) {
-                    getCellItems().remove(what, currentAmount);
-                    this.saveChanges();
-                }
-
-                return currentAmount;
+        if (exactMountRejected || amount == 0) {
+            return 0;
+        }
+        AEAmount currentAmount = getCellItems().getOrDefault(what, AEAmount.ZERO);
+        AEAmount extracted = currentAmount.min(AEAmount.of(amount));
+        if (mode == Actionable.MODULATE && !extracted.equals(AEAmount.ZERO)) {
+            AEAmount remaining = currentAmount.subtractExact(extracted);
+            if (remaining.equals(AEAmount.ZERO)) {
+                getCellItems().remove(what);
             } else {
-                if (mode == Actionable.MODULATE) {
-                    getCellItems().put(what, currentAmount - amount);
-                    this.saveChanges();
-                }
+                getCellItems().put(what, remaining);
+            }
+            saveChanges();
+        }
+        return extracted.longValueExact();
+    }
 
+    @Override
+    public ExactCellId exactCellId() {
+        ExactCellStorageManager manager = requireCurrentManager();
+        return ensureExactCellIdentity(manager);
+    }
+
+    @Override
+    public long exactCellRevision() {
+        getCellItems();
+        return exactCellRevision;
+    }
+
+    @Override
+    public void enumerateExact(java.util.function.BiConsumer<AEKey, AEAmount> visitor) {
+        Objects.requireNonNull(visitor, "visitor");
+        if (exactMountRejected) {
+            throw new IllegalStateException("duplicate exact cell UUID is fail-closed");
+        }
+        getCellItems().forEach(visitor);
+    }
+
+    @Override
+    public boolean claimExactMount(Object owner) {
+        Objects.requireNonNull(owner, "owner");
+        ExactCellStorageManager manager = requireCurrentManager();
+        ExactCellId id = ensureExactCellIdentity(manager);
+        if (exactMountToken == null) {
+            exactMountToken = new Object();
+        }
+        boolean claimed = manager.claimMount(id, exactMountToken);
+        exactMountRejected = !claimed;
+        return claimed;
+    }
+
+    @Override
+    public void releaseExactMount(Object owner) {
+        Objects.requireNonNull(owner, "owner");
+        if (exactMountToken != null && exactCellId != null) {
+            requireCurrentManager().releaseMount(exactCellId, exactMountToken);
+        }
+        exactMountToken = null;
+        exactMountRejected = false;
+    }
+
+    private AEAmount readStoredItemCountSummary() {
+        CompoundTag tag = getTag();
+        if (tag.contains(ExactCellStorageManager.CELL_COUNT_TAG, Tag.TAG_COMPOUND)) {
+            PersistenceDecodeResult<AEAmount> decoded = AEAmountNbtCodec
+                    .decode(tag.getCompound(ExactCellStorageManager.CELL_COUNT_TAG));
+            if (decoded instanceof PersistenceDecodeResult.Success<?> success
+                    && success.value() instanceof AEAmount amount) {
                 return amount;
             }
+            throw new IllegalStateException("malformed exact cell amount summary");
         }
+        long legacy = tag.getLong(ITEM_COUNT_TAG);
+        return legacy < 0 ? AEAmount.ZERO : AEAmount.of(legacy);
+    }
 
-        return 0;
+    private short readStoredItemTypesSummary() {
+        CompoundTag tag = getTag();
+        if (tag.contains(ExactCellStorageManager.CELL_TYPES_TAG, Tag.TAG_INT)) {
+            int types = tag.getInt(ExactCellStorageManager.CELL_TYPES_TAG);
+            if (types < 0 || types > MAX_ITEM_TYPES) {
+                throw new IllegalStateException("malformed exact cell type summary");
+            }
+            return (short) types;
+        }
+        return (short) tag.getLongArray(STACK_AMOUNTS).length;
+    }
+
+    private void recalculateSummaries() {
+        storedItems = (short) getCellItems().size();
+        AEAmount total = AEAmount.ZERO;
+        for (AEAmount amount : getCellItems().values()) {
+            total = total.add(amount);
+        }
+        storedItemCount = total;
+    }
+
+    private void persistLegacyFallback() {
+        ListTag keys = new ListTag();
+        long[] amounts = new long[getCellItems().size()];
+        int index = 0;
+        for (Map.Entry<AEKey, AEAmount> entry : getCellItems().entrySet()) {
+            keys.add(entry.getKey().toTagGeneric());
+            amounts[index++] = entry.getValue().longValueExact();
+        }
+        if (keys.isEmpty()) {
+            getTag().remove(STACK_KEYS);
+            getTag().remove(STACK_AMOUNTS);
+            getTag().remove(ITEM_COUNT_TAG);
+        } else {
+            getTag().put(STACK_KEYS, keys);
+            getTag().putLongArray(STACK_AMOUNTS, amounts);
+            getTag().putLong(ITEM_COUNT_TAG, storedItemCount.longValueExact());
+        }
+    }
+
+    private void writeExactItemSummary(ExactCellId id) {
+        CompoundTag tag = getTag();
+        tag.putUUID(ExactCellStorageManager.CELL_ID_TAG, id.value());
+        tag.put(ExactCellStorageManager.CELL_COUNT_TAG, AEAmountNbtCodec.encode(storedItemCount));
+        tag.putInt(ExactCellStorageManager.CELL_TYPES_TAG, storedItems);
+        tag.putLong(ITEM_COUNT_TAG, projectLong(storedItemCount));
+        ListTag preview = new ListTag();
+        getCellItems().entrySet().stream().sorted(Map.Entry.<AEKey, AEAmount>comparingByValue().reversed())
+                .limit(MAX_TOOLTIP_PREVIEW).forEach(entry -> {
+                    CompoundTag previewEntry = new CompoundTag();
+                    previewEntry.put("key", entry.getKey().toTagGeneric());
+                    previewEntry.put("amount", AEAmountNbtCodec.encode(entry.getValue()));
+                    preview.add(previewEntry);
+                });
+        if (preview.isEmpty()) {
+            tag.remove(ExactCellStorageManager.CELL_PREVIEW_TAG);
+        } else {
+            tag.put(ExactCellStorageManager.CELL_PREVIEW_TAG, preview);
+        }
+        tag.remove(STACK_KEYS);
+        tag.remove(STACK_AMOUNTS);
+    }
+
+    private boolean hasExactCellId() {
+        CompoundTag tag = getTag();
+        if (!tag.contains(ExactCellStorageManager.CELL_ID_TAG)) {
+            return false;
+        }
+        if (!tag.hasUUID(ExactCellStorageManager.CELL_ID_TAG)) {
+            throw new IllegalStateException("malformed exact cell UUID");
+        }
+        return true;
+    }
+
+    private ExactCellId ensureExactCellIdentity(ExactCellStorageManager manager) {
+        if (exactCellId != null) {
+            manager.snapshot(exactCellId);
+            return exactCellId;
+        }
+        if (hasExactCellId()) {
+            exactCellId = new ExactCellId(getTag().getUUID(ExactCellStorageManager.CELL_ID_TAG));
+            ExactCellSnapshot snapshot = manager.snapshot(exactCellId);
+            exactCellRevision = snapshot.revision();
+            return exactCellId;
+        }
+        getCellItems();
+        exactCellId = manager.create(exactCellDescriptor(), storedAmounts);
+        exactCellRevision = 0;
+        writeExactItemSummary(exactCellId);
+        if (container != null) {
+            container.saveChanges();
+        }
+        return exactCellId;
+    }
+
+    private ExactCellDescriptor exactCellDescriptor() {
+        return new ExactCellDescriptor(BuiltInRegistries.ITEM.getKey(i.getItem()), keyType.getId(),
+                Math.toIntExact(getTotalBytes()), getBytesPerType(), Math.toIntExact(getTotalItemTypes()),
+                getExactTotalItemCapacity());
+    }
+
+    private static long projectLong(AEAmount amount) {
+        return amount.toBigInteger().min(BigInteger.valueOf(Long.MAX_VALUE)).longValueExact();
+    }
+
+    private static ExactCellStorageManager currentManager() {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        return server != null && server.isSameThread() ? ExactCellStorageManager.get(server) : null;
+    }
+
+    private static ExactCellStorageManager requireCurrentManager() {
+        ExactCellStorageManager manager = currentManager();
+        if (manager == null) {
+            throw new IllegalStateException("exact cell storage requires the server thread");
+        }
+        return manager;
     }
 
     @Override

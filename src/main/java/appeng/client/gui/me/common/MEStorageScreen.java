@@ -51,6 +51,7 @@ import appeng.api.config.ViewItems;
 import appeng.api.features.HotkeyAction;
 import appeng.api.implementations.blockentities.IMEChest;
 import appeng.api.stacks.AEItemKey;
+import appeng.api.stacks.AEKey;
 import appeng.api.stacks.AmountFormat;
 import appeng.api.storage.AEKeyFilter;
 import appeng.api.util.IConfigManager;
@@ -87,6 +88,8 @@ import appeng.menu.SlotSemantics;
 import appeng.menu.me.common.GridInventoryEntry;
 import appeng.menu.me.common.MEStorageMenu;
 import appeng.menu.me.crafting.CraftingStatusMenu;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
+import appeng.rebuild.quantity.AEAmount;
 import appeng.util.IConfigManagerListener;
 import appeng.util.Platform;
 import appeng.util.prioritylist.IPartitionList;
@@ -291,7 +294,7 @@ public class MEStorageScreen<C extends MEStorageMenu>
         }
 
         // Otherwise only craft if there are no stored items
-        return entry.getStoredAmount() == 0 && entry.isCraftable();
+        return entry.getExactStoredAmount().equals(AEAmount.ZERO) && entry.isCraftable();
     }
 
     private void updateScrollbar() {
@@ -574,17 +577,17 @@ public class MEStorageScreen<C extends MEStorageMenu>
 
                     // If a view mode is selected that only shows craftable items, display the "craftable" text
                     // regardless of stack size
-                    long storedAmount = entry.getStoredAmount();
+                    AEAmount storedAmount = entry.getExactStoredAmount();
                     boolean craftable = entry.isCraftable();
                     var useLargeFonts = config.isUseLargeFonts();
-                    if (craftable && (isViewOnlyCraftable() || storedAmount <= 0)) {
+                    if (craftable && (isViewOnlyCraftable() || storedAmount.equals(AEAmount.ZERO))) {
                         var craftLabelText = useLargeFonts ? GuiText.LargeFontCraft.getLocal()
                                 : GuiText.SmallFontCraft.getLocal();
                         StackSizeRenderer.renderSizeLabel(guiGraphics, this.font, s.x, s.y, craftLabelText);
                     } else {
                         AmountFormat format = useLargeFonts ? AmountFormat.SLOT_LARGE_FONT
                                 : AmountFormat.SLOT;
-                        var text = entry.getWhat().formatAmount(storedAmount, format);
+                        var text = formatExactAmount(entry.getWhat(), storedAmount, format);
                         StackSizeRenderer.renderSizeLabel(guiGraphics, this.font, s.x, s.y, text, useLargeFonts);
                         if (craftable) {
                             StackSizeRenderer.renderSizeLabel(guiGraphics, this.font, s.x - 11, s.y - 11, "+", false);
@@ -641,9 +644,12 @@ public class MEStorageScreen<C extends MEStorageMenu>
 
         var currentToolTip = AEKeyRendering.getTooltip(entry.getWhat());
 
-        if (Tooltips.shouldShowAmountTooltip(entry.getWhat(), entry.getStoredAmount())) {
-            currentToolTip.add(
-                    Tooltips.getAmountTooltip(ButtonToolTips.StoredAmount, entry.getWhat(), entry.getStoredAmount()));
+        var projectedStored = LegacyAmountProjection.project(entry.getExactStoredAmount());
+        if (projectedStored.saturated()) {
+            currentToolTip.add(ButtonToolTips.StoredAmount.text(entry.getExactStoredAmount().toString()));
+        } else if (Tooltips.shouldShowAmountTooltip(entry.getWhat(), projectedStored.amount())) {
+            currentToolTip.add(Tooltips.getAmountTooltip(ButtonToolTips.StoredAmount, entry.getWhat(),
+                    projectedStored.amount()));
         }
 
         var requestableAmount = entry.getRequestableAmount();
@@ -653,7 +659,7 @@ public class MEStorageScreen<C extends MEStorageMenu>
         }
 
         // When we're _NOT_ showing the "craft" text as the amount anyway, add a Craftable entry to the tooltip
-        if (entry.isCraftable() && !(isViewOnlyCraftable() || entry.getStoredAmount() <= 0)) {
+        if (entry.isCraftable() && !(isViewOnlyCraftable() || entry.getExactStoredAmount().equals(AEAmount.ZERO))) {
             currentToolTip.add(ButtonToolTips.Craftable.text().copy().withStyle(ChatFormatting.DARK_GRAY));
         }
 
@@ -671,6 +677,15 @@ public class MEStorageScreen<C extends MEStorageMenu>
         } else {
             guiGraphics.renderComponentTooltip(font, currentToolTip, x, y);
         }
+    }
+
+    private static String formatExactAmount(AEKey key, AEAmount amount, AmountFormat format) {
+        var projected = LegacyAmountProjection.project(amount);
+        if (!projected.saturated()) {
+            return key.formatAmount(projected.amount(), format);
+        }
+        String exact = amount.toString();
+        return exact.length() <= 8 ? exact : exact.substring(0, 4) + "e" + (exact.length() - 1);
     }
 
     @Override
