@@ -5,6 +5,7 @@ import java.util.Optional;
 import java.util.function.Consumer;
 
 import appeng.api.networking.security.IActionSource;
+import appeng.rebuild.planner.ExactCraftRequest;
 import appeng.rebuild.storage.BrokerExactStorage;
 
 /**
@@ -181,6 +182,12 @@ public final class ExactCpuExecutionSession {
     public ExactCpuSessionSnapshot snapshot() {
         return new ExactCpuSessionSnapshot(ledger.snapshot(), broker.snapshot(),
                 workOrder.map(ExactWorkOrder::snapshot));
+    }
+
+    /** Returns only the immutable request identity and amount, never the sealed plan or mutable authority. */
+    public Optional<ExactCraftRequest> request() {
+        ExactCraftingPlan plan = ledger.recoveryPlan();
+        return plan == null ? Optional.empty() : Optional.of(plan.request());
     }
 
     private ExactCpuSessionResult transition(WorkOrderTransition transition) {

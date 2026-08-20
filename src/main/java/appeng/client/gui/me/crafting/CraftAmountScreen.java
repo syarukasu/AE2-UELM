@@ -29,6 +29,8 @@ import appeng.client.gui.style.ScreenStyle;
 import appeng.client.gui.widgets.NumberEntryWidget;
 import appeng.core.localization.GuiText;
 import appeng.menu.me.crafting.CraftAmountMenu;
+import appeng.rebuild.planner.PlannerLimits;
+import appeng.rebuild.quantity.AEAmount;
 
 /**
  * When requesting to auto-craft, this dialog allows the player to enter the desired number of items to craft.
@@ -51,7 +53,7 @@ public class CraftAmountScreen extends AEBaseScreen<CraftAmountMenu> {
 
         this.amountToCraft = widgets.addNumberEntryWidget("amountToCraft", NumberEntryType.UNITLESS);
         this.amountToCraft.setMinValue(1);
-        this.amountToCraft.setMaxValue(Long.MAX_VALUE);
+        this.amountToCraft.setExactUnsignedIntegerMode(PlannerLimits.MAX_CRAFT_QUANTITY_BITS);
         this.amountToCraft.setLongValue(1);
         this.amountToCraft.setTextFieldStyle(style.getWidget("amountToCraftInput"));
         this.amountToCraft.setHideValidationIcon(true);
@@ -72,16 +74,16 @@ public class CraftAmountScreen extends AEBaseScreen<CraftAmountMenu> {
         }
 
         this.next.setMessage(hasShiftDown() ? GuiText.Start.text() : GuiText.Next.text());
-        this.next.active = this.amountToCraft.getLongValue().orElse(0) > 0;
+        this.next.active = this.amountToCraft.getUnsignedBigIntegerValue().isPresent();
     }
 
     private void confirm() {
-        long amount = this.amountToCraft.getLongValue().orElse(0);
+        var amount = this.amountToCraft.getUnsignedBigIntegerValue();
         boolean craftMissingAmount = this.amountToCraft.startsWithEquals();
-        if (amount <= 0) {
+        if (amount.isEmpty() || amount.get().signum() <= 0) {
             return;
         }
-        menu.confirm(amount, craftMissingAmount, hasShiftDown());
+        menu.confirm(AEAmount.of(amount.get()), craftMissingAmount, hasShiftDown());
     }
 
 }

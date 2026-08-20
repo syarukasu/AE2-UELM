@@ -53,6 +53,7 @@ import appeng.api.stacks.KeyCounter;
 import appeng.api.util.IConfigManager;
 import appeng.blockentity.crafting.CraftingBlockEntity;
 import appeng.blockentity.crafting.CraftingMonitorBlockEntity;
+import appeng.core.AELog;
 import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.execution.CraftingCpuLogic;
 import appeng.me.cluster.IAECluster;
@@ -60,6 +61,7 @@ import appeng.me.cluster.MBCalculator;
 import appeng.me.helpers.MachineSource;
 import appeng.me.service.CraftingService;
 import appeng.me.service.StorageService;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
 import appeng.rebuild.execution.CurrentPatternSnapshotSource;
 import appeng.rebuild.execution.ExactCpuExecutionSession;
 import appeng.rebuild.execution.ExactCpuLedgerState;
@@ -101,6 +103,8 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     private ExactCpuExecutionSession exactSession;
     @Nullable
     private ExactWorkCommand exactInFlight;
+    private boolean exactDispatching;
+    private boolean exactOutputObserved;
     private final Map<KeyId, AEAmount> exactOutputRemaining = new HashMap<>();
     private final Map<KeyId, AEAmount> exactRemainderRemaining = new HashMap<>();
 
@@ -139,6 +143,12 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             return;
         }
         this.isDestroyed = true;
+
+        // Retain or release exact physical custody before this cluster stops receiving service ticks. The durable
+        // checkpoint remains attached to the core if an in-flight machine command must finish after reformation.
+        if (this.exactSession != null && isExactServerThread()) {
+            cancelExactExecution();
+        }
 
         boolean ownsModification = !MBCalculator.isModificationInProgress();
         if (ownsModification) {
@@ -193,8 +203,8 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     }
 
     public long insert(AEKey what, long amount, Actionable mode, IActionSource source) {
-        if (this.exactSession != null && this.exactInFlight != null) {
-            return insertExactResult(what, amount, mode);
+        if (this.exactSession != null) {
+            return this.exactInFlight == null ? 0 : insertExactResult(what, amount, mode);
         }
         return craftingLogic.insert(what, amount, mode);
     }
@@ -236,37 +246,74 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             return;
         }
         ExactWorkCommand command = commandResult.command();
+        if (!craftingService.claimExactCommand(this, command)) {
+            exactSession.rejectIssued(command);
+            return;
+        }
         var binding = craftingService.getExactBinding(command.pattern());
         if (binding == null) {
+            craftingService.releaseExactCommand(this, command);
             exactSession.rejectIssued(command);
             exactSession.requestCancellation();
             return;
         }
         KeyCounter[] inputs = exactInputs(command, craftingService.getExactKeyRegistry());
         double power = CraftingCpuHelper.calculatePatternPower(inputs);
+        stageExactCommand(command);
         for (var provider : binding.providers()) {
             if (provider.isBusy()
                     || energyService.extractAEPower(power, Actionable.SIMULATE, PowerMultiplier.CONFIG) < power
                             - 0.01) {
                 continue;
             }
-            if (provider.pushPattern(binding.details(), inputs)) {
+            exactDispatching = true;
+            boolean pushed;
+            try {
+                pushed = provider.pushPattern(binding.details(), inputs);
+            } catch (RuntimeException providerFailure) {
+                if (exactOutputObserved) {
+                    exactSession.acceptIssued(command);
+                    exactSession.requestCancellation();
+                } else {
+                    clearStagedExactCommand();
+                    craftingService.releaseExactCommand(this, command);
+                    exactSession.rejectIssued(command);
+                }
+                AELog.warn("Exact crafting provider failed while dispatching a sealed command", providerFailure);
+                return;
+            } finally {
+                exactDispatching = false;
+            }
+            if (pushed || exactOutputObserved) {
                 energyService.extractAEPower(power, Actionable.MODULATE, PowerMultiplier.CONFIG);
-                exactSession.acceptIssued(command);
-                exactInFlight = command;
-                exactOutputRemaining.clear();
-                exactOutputRemaining.putAll(command.expectedOutputs());
-                exactRemainderRemaining.clear();
-                exactRemainderRemaining.putAll(command.expectedRemainders());
+                var accepted = exactSession.acceptIssued(command);
+                if (!(accepted instanceof ExactCpuExecutionSession.Transition transition)
+                        || !(transition
+                                .result() instanceof appeng.rebuild.execution.ExactWorkOrderTransitionResult.Accepted)) {
+                    craftingService.releaseExactCommand(this, command);
+                    exactSession.requestCancellation();
+                    return;
+                }
+                if (exactOutputRemaining.isEmpty() && exactRemainderRemaining.isEmpty()) {
+                    exactSession.completeIssued(command, command.expectedOutputs(), command.expectedRemainders());
+                    exactInFlight = null;
+                    craftingService.releaseExactCommand(this, command);
+                }
                 markDirty();
                 return;
             }
         }
+        clearStagedExactCommand();
+        craftingService.releaseExactCommand(this, command);
         exactSession.rejectIssued(command);
     }
 
     public boolean hasExactExecution() {
         return exactSession != null;
+    }
+
+    public boolean isExactCommandInFlight(ExactWorkCommand command) {
+        return exactInFlight != null && exactInFlight.equals(command);
     }
 
     /** Discards only a plan which has not acquired physical custody. */
@@ -317,13 +364,32 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
         }
         subtractRemaining(exactOutputRemaining, key, acceptedOutput);
         subtractRemaining(exactRemainderRemaining, key, acceptedRemainder);
-        if (exactOutputRemaining.isEmpty() && exactRemainderRemaining.isEmpty()) {
+        exactOutputObserved = true;
+        if (!exactDispatching && exactOutputRemaining.isEmpty() && exactRemainderRemaining.isEmpty()) {
             ExactWorkCommand completed = Objects.requireNonNull(exactInFlight);
             exactSession.completeIssued(completed, completed.expectedOutputs(), completed.expectedRemainders());
             exactInFlight = null;
             markDirty();
         }
         return accepted.longValueExact();
+    }
+
+    private void stageExactCommand(ExactWorkCommand command) {
+        exactInFlight = command;
+        exactDispatching = false;
+        exactOutputObserved = false;
+        exactOutputRemaining.clear();
+        exactOutputRemaining.putAll(command.expectedOutputs());
+        exactRemainderRemaining.clear();
+        exactRemainderRemaining.putAll(command.expectedRemainders());
+    }
+
+    private void clearStagedExactCommand() {
+        exactInFlight = null;
+        exactDispatching = false;
+        exactOutputObserved = false;
+        exactOutputRemaining.clear();
+        exactRemainderRemaining.clear();
     }
 
     private static AEAmount minimum(AEAmount left, AEAmount right) {
@@ -377,7 +443,12 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
 
     @Override
     public void cancelJob() {
-        craftingLogic.cancel();
+        if (exactSession != null) {
+            requireExactServerThread();
+            cancelExactExecution();
+        } else {
+            craftingLogic.cancel();
+        }
     }
 
     public ICraftingSubmitResult submitJob(IGrid g, ICraftingPlan plan, IActionSource src,
@@ -387,12 +458,25 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
 
     @Override
     public boolean isBusy() {
-        return craftingLogic.hasJob();
+        return exactSession != null || craftingLogic.hasJob();
     }
 
     @Nullable
     @Override
     public CraftingJobStatus getJobStatus() {
+        if (exactSession != null) {
+            var request = exactSession.request().orElse(null);
+            KeyRegistry registry = exactKeyRegistry();
+            if (request == null || registry == null) {
+                return null;
+            }
+            long total = LegacyAmountProjection.saturatingLong(request.amount());
+            long progress = exactSession.snapshot().workOrder()
+                    .filter(order -> order.state() == ExactWorkOrderState.COMPLETED)
+                    .map(order -> total).orElse(0L);
+            return new CraftingJobStatus(new GenericStack(registry.resolve(request.output()), total), total, progress,
+                    0L);
+        }
         var finalOutput = craftingLogic.getFinalJobOutput();
         if (finalOutput != null) {
             var elapsedTimeTracker = craftingLogic.getElapsedTimeTracker();
@@ -406,6 +490,19 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
                     elapsedTimeTracker.getElapsedTime());
         } else {
             return null;
+        }
+    }
+
+    private void cancelExactExecution() {
+        var snapshot = exactSession.snapshot();
+        if (snapshot.workOrder().isPresent()) {
+            exactSession.requestCancellation();
+        } else if (snapshot.broker().state() == ExactTransferBrokerState.RESERVED) {
+            exactSession.cancelReservation();
+        } else if (snapshot.ledger().state() == ExactCpuLedgerState.PREPARED
+                && snapshot.broker().state() == ExactTransferBrokerState.IDLE) {
+            exactSession.discardPrepared();
+            exactSession = null;
         }
     }
 

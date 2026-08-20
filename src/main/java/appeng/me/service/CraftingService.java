@@ -82,10 +82,12 @@ import appeng.me.helpers.InterestManager;
 import appeng.me.helpers.StackWatcher;
 import appeng.me.service.helpers.CraftingServiceStorage;
 import appeng.me.service.helpers.NetworkCraftingProviders;
+import appeng.rebuild.api.legacy.LegacyAmountProjection;
 import appeng.rebuild.execution.ExactCpuLedgerState;
 import appeng.rebuild.execution.ExactCraftingPlanValidator;
 import appeng.rebuild.execution.ExactPlanValidationResult;
 import appeng.rebuild.execution.ExactTransferBrokerState;
+import appeng.rebuild.execution.ExactWorkCommand;
 import appeng.rebuild.key.KeyId;
 import appeng.rebuild.pattern.CompiledPattern;
 import appeng.rebuild.pattern.GraphGeneration;
@@ -123,6 +125,10 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
 
     private static final ExecutorService CRAFTING_POOL;
     private static boolean recipeReloadFailureObserverBound;
+
+    /** At most one untagged legacy provider result may be attributed to an exact command on this grid. */
+    @Nullable
+    private ExactCommandRoute exactCommandRoute;
 
     static {
         final ThreadFactory factory = ar -> {
@@ -351,13 +357,41 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
         link.setNexus(nexus);
     }
 
-    public long insertIntoCpus(AEKey what, long amount, Actionable type) {
+    public long insertIntoCpus(AEKey what, long amount, Actionable type, IActionSource source) {
         long inserted = 0;
+        ExactCommandRoute route = exactCommandRoute;
+        if (route != null) {
+            inserted = route.cpu.insert(what, amount, type, source);
+            if (!route.cpu.isExactCommandInFlight(route.command)) {
+                exactCommandRoute = null;
+            }
+        }
         for (var cpu : this.craftingCPUClusters) {
-            inserted += cpu.craftingLogic.insert(what, amount - inserted, type);
+            if (!cpu.hasExactExecution()) {
+                inserted += cpu.insert(what, amount - inserted, type, source);
+            }
         }
 
         return inserted;
+    }
+
+    /** Serializes the legacy provider return channel so two exact CPUs cannot claim the same physical output. */
+    public boolean claimExactCommand(CraftingCPUCluster cpu, ExactWorkCommand command) {
+        if (exactCommandRoute != null
+                && !exactCommandRoute.cpu.isExactCommandInFlight(exactCommandRoute.command)) {
+            exactCommandRoute = null;
+        }
+        if (exactCommandRoute != null) {
+            return exactCommandRoute.cpu == cpu && exactCommandRoute.command.equals(command);
+        }
+        exactCommandRoute = new ExactCommandRoute(cpu, command);
+        return true;
+    }
+
+    public void releaseExactCommand(CraftingCPUCluster cpu, ExactWorkCommand command) {
+        if (exactCommandRoute != null && exactCommandRoute.cpu == cpu && exactCommandRoute.command.equals(command)) {
+            exactCommandRoute = null;
+        }
     }
 
     @Override
@@ -520,7 +554,12 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             throw new IllegalArgumentException("Invalid Crafting Job Request");
         }
 
-        ExactCalculationInput exact = captureExactCalculation(what, AEAmount.of(amount));
+        IActionSource calculationSource = simRequester.getActionSource();
+        // Automatic requesters still require a durable requester-link delivery protocol. Keep them on the native
+        // legacy calculation until that protocol is exact; never hand an exact authoritative plan to legacy execution.
+        ExactCalculationInput exact = calculationSource != null && calculationSource.player().isPresent()
+                ? captureExactCalculation(what, AEAmount.of(amount))
+                : null;
         if (exact != null) {
             return CompletableFuture.supplyAsync(() -> calculateExact(what, amount, exact), CRAFTING_POOL);
         }
@@ -538,6 +577,25 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
                     new ExactPlanValidationResult.Failure(ExactPlanValidationResult.FailureReason.MALFORMED_PATTERN));
         }
         return CompletableFuture.supplyAsync(() -> calculateAndValidate(input), CRAFTING_POOL);
+    }
+
+    /** Player/menu planning entry that retains exact request quantities and only falls back when narrowing is exact. */
+    public Future<ICraftingPlan> beginCraftingCalculationExact(Level level,
+            ICraftingSimulationRequester simRequester, AEKey what, AEAmount amount, CalculationStrategy strategy) {
+        if (level == null || simRequester == null || what == null || amount == null || amount.equals(AEAmount.ZERO)) {
+            throw new IllegalArgumentException("Invalid exact crafting job request");
+        }
+        ExactCalculationInput input = captureExactCalculation(what, amount);
+        if (input != null) {
+            return CompletableFuture.supplyAsync(
+                    () -> calculateExact(what, LegacyAmountProjection.saturatingLong(amount), input), CRAFTING_POOL);
+        }
+        try {
+            return beginCraftingCalculation(level, simRequester, what, amount.longValueExact(), strategy);
+        } catch (ArithmeticException unsupportedExactAmount) {
+            return CompletableFuture.completedFuture(
+                    new appeng.crafting.ExactCraftingFailurePlan(what, Long.MAX_VALUE));
+        }
     }
 
     /** Submits a previously sealed exact plan through the same native CPU path used by crafting terminals. */
@@ -608,6 +666,13 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             NormalizedPatternSnapshot patterns) {
     }
 
+    private record ExactCommandRoute(CraftingCPUCluster cpu, ExactWorkCommand command) {
+        private ExactCommandRoute {
+            java.util.Objects.requireNonNull(cpu, "cpu");
+            java.util.Objects.requireNonNull(command, "command");
+        }
+    }
+
     @Override
     public ICraftingSubmitResult submitJob(ICraftingPlan job, ICraftingRequester requestingMachine, ICraftingCPU target,
             boolean prioritizePower, IActionSource src) {
@@ -633,8 +698,9 @@ public class CraftingService implements ICraftingService, IGridServiceProvider {
             }
         }
 
-        if (job instanceof ExactCraftingPlanAdapter exact && requestingMachine == null) {
-            return submitExact(cpuCluster, exact, src);
+        if (job instanceof ExactCraftingPlanAdapter exact) {
+            return requestingMachine == null ? submitExact(cpuCluster, exact, src)
+                    : CraftingSubmitResult.INCOMPLETE_PLAN;
         }
         return cpuCluster.submitJob(this.grid, job, src, requestingMachine);
     }

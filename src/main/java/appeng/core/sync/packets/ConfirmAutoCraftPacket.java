@@ -25,21 +25,27 @@ import net.minecraft.server.level.ServerPlayer;
 
 import appeng.core.sync.BasePacket;
 import appeng.menu.me.crafting.CraftAmountMenu;
+import appeng.rebuild.api.exact.ExactAmountCodec;
+import appeng.rebuild.quantity.AEAmount;
 
 public class ConfirmAutoCraftPacket extends BasePacket {
 
-    private final long amount;
+    private final AEAmount amount;
+    private final boolean valid;
     private final boolean craftMissingAmount;
     private final boolean autoStart;
 
     public ConfirmAutoCraftPacket(FriendlyByteBuf stream) {
         this.autoStart = stream.readBoolean();
         this.craftMissingAmount = stream.readBoolean();
-        this.amount = stream.readLong();
+        var decoded = ExactAmountCodec.read(stream);
+        this.valid = decoded instanceof ExactAmountCodec.Success;
+        this.amount = valid ? ((ExactAmountCodec.Success) decoded).amount() : AEAmount.ZERO;
     }
 
-    public ConfirmAutoCraftPacket(long craftAmt, boolean craftMissingAmount, boolean autoStart) {
+    public ConfirmAutoCraftPacket(AEAmount craftAmt, boolean craftMissingAmount, boolean autoStart) {
         this.amount = craftAmt;
+        this.valid = !craftAmt.equals(AEAmount.ZERO);
         this.craftMissingAmount = craftMissingAmount;
         this.autoStart = autoStart;
 
@@ -47,13 +53,13 @@ public class ConfirmAutoCraftPacket extends BasePacket {
         data.writeInt(this.getPacketID());
         data.writeBoolean(autoStart);
         data.writeBoolean(craftMissingAmount);
-        data.writeLong(this.amount);
+        ExactAmountCodec.write(data, this.amount);
         this.configureWrite(data);
     }
 
     @Override
     public void serverPacketData(ServerPlayer player) {
-        if (player.containerMenu instanceof CraftAmountMenu menu) {
+        if (valid && player.containerMenu instanceof CraftAmountMenu menu) {
             menu.confirm(amount, craftMissingAmount, autoStart);
         }
     }

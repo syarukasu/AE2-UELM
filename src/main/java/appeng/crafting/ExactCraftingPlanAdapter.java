@@ -12,6 +12,7 @@ import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.rebuild.api.legacy.LegacyAmountProjection;
 import appeng.rebuild.execution.ExactCraftingPlan;
+import appeng.rebuild.key.KeyId;
 import appeng.rebuild.key.KeyRegistry;
 import appeng.rebuild.pattern.PatternId;
 
@@ -45,6 +46,10 @@ public final class ExactCraftingPlanAdapter implements ICraftingPlan {
 
     public ExactCraftingPlan exactPlan() {
         return exactPlan;
+    }
+
+    public appeng.api.stacks.AEKey resolve(KeyId key) {
+        return keys.resolve(key);
     }
 
     @Override
