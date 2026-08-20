@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -54,6 +55,8 @@ import appeng.api.util.IConfigManager;
 import appeng.blockentity.crafting.CraftingBlockEntity;
 import appeng.blockentity.crafting.CraftingMonitorBlockEntity;
 import appeng.core.AELog;
+import appeng.core.sync.network.NetworkHandler;
+import appeng.core.sync.packets.CraftingJobStatusPacket;
 import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.execution.CraftingCpuLogic;
 import appeng.me.cluster.IAECluster;
@@ -107,6 +110,10 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     private boolean exactOutputObserved;
     private final Map<KeyId, AEAmount> exactOutputRemaining = new HashMap<>();
     private final Map<KeyId, AEAmount> exactRemainderRemaining = new HashMap<>();
+    @Nullable
+    private UUID exactPlayerId;
+    private long exactStartedNanos;
+    private boolean exactCancellationRequested;
 
     public CraftingCPUCluster(BlockPos boundsMin, BlockPos boundsMax) {
         this.boundsMin = boundsMin.immutable();
@@ -233,6 +240,8 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             exactSession.progressWorkRelease(1024);
             if (exactSession.snapshot().workOrder().map(s -> s.state() == ExactWorkOrderState.COMPLETED)
                     .orElse(false)) {
+                notifyExactJob(exactCancellationRequested ? CraftingJobStatusPacket.Status.CANCELLED
+                        : CraftingJobStatusPacket.Status.FINISHED);
                 exactSession = null;
             }
             return;
@@ -496,6 +505,7 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
     private void cancelExactExecution() {
         var snapshot = exactSession.snapshot();
         if (snapshot.workOrder().isPresent()) {
+            exactCancellationRequested = true;
             exactSession.requestCancellation();
         } else if (snapshot.broker().state() == ExactTransferBrokerState.RESERVED) {
             exactSession.cancelReservation();
@@ -504,6 +514,27 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
             exactSession.discardPrepared();
             exactSession = null;
         }
+    }
+
+    private void notifyExactJob(CraftingJobStatusPacket.Status status) {
+        if (exactSession == null || exactPlayerId == null) {
+            return;
+        }
+        CraftingBlockEntity core = getCore();
+        if (core == null || !(core.getLevel() instanceof ServerLevel level)) {
+            return;
+        }
+        var player = level.getServer().getPlayerList().getPlayer(exactPlayerId);
+        var request = exactSession.request().orElse(null);
+        var planId = exactSession.planId().orElse(null);
+        KeyRegistry registry = exactKeyRegistry();
+        if (player == null || request == null || planId == null || registry == null) {
+            return;
+        }
+        AEAmount remaining = status == CraftingJobStatusPacket.Status.FINISHED ? AEAmount.ZERO : request.amount();
+        long elapsed = exactStartedNanos == 0L ? 0L : Math.max(0L, System.nanoTime() - exactStartedNanos);
+        NetworkHandler.instance().sendTo(new CraftingJobStatusPacket(planId.value(), registry.resolve(request.output()),
+                request.amount(), remaining, elapsed, status), player);
     }
 
     @Override
@@ -587,7 +618,11 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
         }
         this.exactSession = ExactCpuExecutionSession.create(storage, patterns, this::isExactServerThread, source,
                 this::replaceExactRecovery, this::clearExactRecovery);
-        return this.exactSession.prepare(plan);
+        var result = this.exactSession.prepare(plan);
+        this.exactPlayerId = source.player().map(player -> player.getUUID()).orElse(null);
+        this.exactStartedNanos = 0L;
+        this.exactCancellationRequested = false;
+        return result;
     }
 
     /** Advances the CPU-owned exact reservation; callers receive immutable state only. */
@@ -597,7 +632,13 @@ public final class CraftingCPUCluster implements IAECluster, ICraftingCPU {
 
     /** Transfers the exact reservation into the CPU-owned work order. */
     public ExactCpuExecutionSession.ExactCpuSessionResult startExactWorkOrder() {
-        return requireExactSession().startWorkOrder();
+        var result = requireExactSession().startWorkOrder();
+        if (result instanceof ExactCpuExecutionSession.Broker broker
+                && broker.result().type() == ExactCpuExecutionSession.BrokerOutcomeType.STARTED) {
+            exactStartedNanos = System.nanoTime();
+            notifyExactJob(CraftingJobStatusPacket.Status.STARTED);
+        }
+        return result;
     }
 
     /** Cancels a reservation which has not been handed to a work order. */

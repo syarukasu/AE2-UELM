@@ -190,6 +190,11 @@ public final class ExactCpuExecutionSession {
         return plan == null ? Optional.empty() : Optional.of(plan.request());
     }
 
+    public Optional<ExactPlanId> planId() {
+        ExactCraftingPlan plan = ledger.recoveryPlan();
+        return plan == null ? Optional.empty() : Optional.of(plan.planId());
+    }
+
     private ExactCpuSessionResult transition(WorkOrderTransition transition) {
         if (workOrder.isEmpty()) {
             return new Unavailable(UnavailableReason.NO_WORK_ORDER, snapshot());
